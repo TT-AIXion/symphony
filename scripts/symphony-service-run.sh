@@ -6,7 +6,15 @@ if [[ $# -ne 2 ]]; then
   exit 64
 fi
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
+script_source="$(python3 - <<'PY' "$0"
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+
+script_dir="$(cd "$(dirname "$script_source")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 project_root="$repo_root/elixir"
 
