@@ -42,7 +42,9 @@ defmodule SymphonyElixir.AgentRunner do
                   maybe_comment_partial_response(
                     prepared_issue,
                     reason,
-                    Keyword.put(opts, :workspace_path, codex_cwd)
+                    opts
+                    |> Keyword.put(:workspace_path, codex_cwd)
+                    |> Keyword.put(:worker_host, worker_host)
                   )
 
                   handle_question_required(prepared_issue, payload)
@@ -51,7 +53,9 @@ defmodule SymphonyElixir.AgentRunner do
                   maybe_comment_partial_response(
                     prepared_issue,
                     reason,
-                    Keyword.put(opts, :workspace_path, codex_cwd)
+                    opts
+                    |> Keyword.put(:workspace_path, codex_cwd)
+                    |> Keyword.put(:worker_host, worker_host)
                   )
 
                   handle_question_required(prepared_issue, payload)
@@ -106,14 +110,34 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          worker_host,
+          1,
+          max_turns
+        )
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         worker_host,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -124,7 +148,15 @@ defmodule SymphonyElixir.AgentRunner do
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
-      maybe_comment_turn_response(issue, turn_session, workspace, turn_number, max_turns)
+
+      maybe_comment_turn_response(
+        issue,
+        turn_session,
+        workspace,
+        worker_host,
+        turn_number,
+        max_turns
+      )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -137,6 +169,7 @@ defmodule SymphonyElixir.AgentRunner do
             codex_update_recipient,
             opts,
             issue_state_fetcher,
+            worker_host,
             turn_number + 1,
             max_turns
           )
@@ -256,6 +289,7 @@ defmodule SymphonyElixir.AgentRunner do
          %Issue{id: issue_id} = issue,
          %{result: result} = turn_session,
          workspace,
+         worker_host,
          turn_number,
          max_turns
        )
@@ -269,7 +303,8 @@ defmodule SymphonyElixir.AgentRunner do
             response_text,
             turn_number,
             max_turns,
-            workspace
+            workspace,
+            worker_host
           )
 
         case Tracker.create_comment(issue_id, body) do
@@ -289,8 +324,15 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp maybe_comment_turn_response(_issue, _turn_session, _workspace, _turn_number, _max_turns),
-    do: :ok
+  defp maybe_comment_turn_response(
+         _issue,
+         _turn_session,
+         _workspace,
+         _worker_host,
+         _turn_number,
+         _max_turns
+       ),
+       do: :ok
 
   defp maybe_comment_partial_response(
          %Issue{id: issue_id} = issue,
@@ -313,7 +355,8 @@ defmodule SymphonyElixir.AgentRunner do
             response_text,
             turn_number,
             max_turns,
-            opts[:workspace_path]
+            opts[:workspace_path],
+            opts[:worker_host]
           )
 
         case Tracker.create_comment(issue_id, body) do
@@ -340,7 +383,8 @@ defmodule SymphonyElixir.AgentRunner do
          response_text,
          turn_number,
          max_turns,
-         workspace
+         workspace,
+         worker_host
        ) do
     session_lines =
       case turn_session[:session_id] do
@@ -354,7 +398,8 @@ defmodule SymphonyElixir.AgentRunner do
     diff_lines =
       case workspace do
         path when is_binary(path) and path != "" ->
-          ["差分確認: `cd #{path} && git diff --stat && git diff`"]
+          format_diff_summary_lines(path, worker_host) ++
+            ["差分確認: `cd #{path} && git diff --stat && git diff`"]
 
         _ ->
           []
@@ -422,6 +467,76 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.trim_leading("-")
     |> String.trim_leading("*")
     |> String.trim()
+  end
+
+  defp format_diff_summary_lines(workspace, worker_host) do
+    changed_files =
+      workspace
+      |> git_output(["diff", "--name-only"], worker_host)
+      |> parse_changed_files()
+
+    diff_summary =
+      workspace
+      |> git_output(["diff", "--shortstat"], worker_host)
+      |> normalize_git_summary()
+
+    file_lines =
+      case changed_files do
+        [] -> []
+        files -> ["変更ファイル: " <> Enum.map_join(files, ", ", &"`#{&1}`")]
+      end
+
+    summary_lines =
+      case diff_summary do
+        nil -> []
+        summary -> ["差分概要: #{summary}"]
+      end
+
+    file_lines ++ summary_lines
+  end
+
+  defp git_output(workspace, args, nil) when is_binary(workspace) and is_list(args) do
+    case System.cmd("git", args, cd: workspace, stderr_to_stdout: true) do
+      {output, 0} -> output
+      _ -> nil
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp git_output(workspace, args, worker_host)
+       when is_binary(workspace) and is_list(args) and is_binary(worker_host) do
+    command =
+      ["cd #{shell_escape(workspace)}", "git #{Enum.join(Enum.map(args, &shell_escape/1), " ")}"]
+      |> Enum.join(" && ")
+
+    case SymphonyElixir.SSH.run(worker_host, command) do
+      {:ok, {output, 0}} -> output
+      _ -> nil
+    end
+  end
+
+  defp parse_changed_files(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.take(3)
+  end
+
+  defp parse_changed_files(_output), do: []
+
+  defp normalize_git_summary(output) when is_binary(output) do
+    case String.trim(output) do
+      "" -> nil
+      summary -> summary
+    end
+  end
+
+  defp normalize_git_summary(_output), do: nil
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
   defp handle_question_required(%Issue{id: issue_id} = issue, payload) when is_binary(issue_id) do
