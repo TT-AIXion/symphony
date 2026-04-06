@@ -78,6 +78,7 @@ LINEAR_API_KEY=... ./scripts/setup-macos-service.sh
 What it does:
 
 - writes `~/.config/symphony/linear_api_key` when `LINEAR_API_KEY` is set
+- prompts for `LINEAR_API_KEY` when it is not already available and the setup runs interactively
 - runs `mise trust`, `mise install`, `mix setup`, and `mix build`
 - installs `~/Library/LaunchAgents/com.aixion.symphony.symphony.plist`
 - installs `~/Library/LaunchAgents/com.aixion.symphony.symphony-updater.plist`

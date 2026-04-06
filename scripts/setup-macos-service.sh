@@ -49,9 +49,24 @@ if [[ -n "${LINEAR_API_KEY:-}" ]]; then
 fi
 
 if [[ ! -f "$token_file" ]]; then
-  echo "missing $token_file" >&2
-  echo "Set LINEAR_API_KEY in the environment before running this script, or create the file manually." >&2
-  exit 1
+  if [[ -t 0 && -t 1 ]]; then
+    echo "LINEAR_API_KEY is required to run Symphony against Linear."
+    printf 'Enter LINEAR_API_KEY: ' > /dev/tty
+    read -r -s linear_api_key < /dev/tty
+    printf '\n' > /dev/tty
+
+    if [[ -z "${linear_api_key:-}" ]]; then
+      echo "LINEAR_API_KEY was not provided." >&2
+      exit 1
+    fi
+
+    umask 077
+    printf '%s\n' "$linear_api_key" > "$token_file"
+  else
+    echo "missing $token_file" >&2
+    echo "Set LINEAR_API_KEY in the environment before running this script, or run it interactively so it can prompt you." >&2
+    exit 1
+  fi
 fi
 
 cd "$project_root"

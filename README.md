@@ -45,6 +45,9 @@ That setup also installs a companion updater job which runs every 3 hours, pulls
 falls back to Codex + the `pull` skill if the direct pull fails, rebuilds the escript, and
 restarts the service.
 
+If `LINEAR_API_KEY` is not already available in the environment or
+`~/.config/symphony/linear_api_key`, the setup script will prompt for it interactively.
+
 ---
 
 ## License

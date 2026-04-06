@@ -71,6 +71,8 @@ This repository contains the Symphony orchestration service and its language-agn
 
 - For deterministic repo-local auto-start on macOS after clone, always use `./scripts/setup-macos-service.sh`.
 - Do not hand-roll LaunchAgents, workflow links, or updater jobs when this script is available.
+- If required setup information is missing, the setup flow should ask the user for it instead of silently assuming values.
+- In particular, `LINEAR_API_KEY` should be prompted for during setup when it is not already present in the environment or `~/.config/symphony/linear_api_key`.
 - The LaunchAgent must execute the runner from the cloned repo path so future `git pull` updates on that clone are picked up automatically.
 - Workflow activation for the local service should symlink `~/.config/symphony/workflows/symphony.WORKFLOW.md` to `<clone>/elixir/WORKFLOW.md`.
 - Install a companion updater LaunchAgent that runs every 3 hours.
