@@ -1254,9 +1254,10 @@ defmodule SymphonyElixir.CoreTest do
 
       assert_receive {:memory_tracker_comment, "issue-final-comment", body}, 1_000
       assert body =~ "## Codex 応答"
-      assert body =~ "ターン: 1/1"
-      assert body =~ "セッション: `thread-comment-turn-comment`"
-      assert body =~ "Shipped the fix."
+      assert body =~ "- ターン: 1/1"
+      assert body =~ "- セッション: `thread-comment-turn-comment`"
+      assert body =~ "- Shipped the fix."
+      assert body =~ "差分確認: `cd "
     after
       File.rm_rf(test_root)
     end
@@ -1615,6 +1616,7 @@ defmodule SymphonyElixir.CoreTest do
       trace = File.read!(trace_file)
 
       assert trace =~ "Operator steer from new Linear comments:"
+      assert trace =~ "Linear comment guidance:"
       assert trace =~ "Takuto at 2026-04-06T06:00:00Z"
       assert trace =~ "この issue はまず影響範囲を確認してから進めてください。"
     after

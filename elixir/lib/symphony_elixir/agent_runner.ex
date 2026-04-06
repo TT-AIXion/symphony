@@ -39,11 +39,21 @@ defmodule SymphonyElixir.AgentRunner do
             with :ok <- Workspace.run_before_run_hook(codex_cwd, issue, worker_host) do
               case run_codex_turns(codex_cwd, prepared_issue, codex_update_recipient, opts, worker_host) do
                 {:error, %{reason: %{type: :turn_input_required, payload: payload} = reason}} ->
-                  maybe_comment_partial_response(prepared_issue, reason, opts)
+                  maybe_comment_partial_response(
+                    prepared_issue,
+                    reason,
+                    Keyword.put(opts, :workspace_path, codex_cwd)
+                  )
+
                   handle_question_required(prepared_issue, payload)
 
                 {:error, %{reason: %{type: :approval_required, payload: payload} = reason}} ->
-                  maybe_comment_partial_response(prepared_issue, reason, opts)
+                  maybe_comment_partial_response(
+                    prepared_issue,
+                    reason,
+                    Keyword.put(opts, :workspace_path, codex_cwd)
+                  )
+
                   handle_question_required(prepared_issue, payload)
 
                 other ->
@@ -114,7 +124,7 @@ defmodule SymphonyElixir.AgentRunner do
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
-      maybe_comment_turn_response(issue, turn_session, turn_number, max_turns)
+      maybe_comment_turn_response(issue, turn_session, workspace, turn_number, max_turns)
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -147,12 +157,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(issue, opts, turn_number, max_turns) do
     steer_block = steer_comment_block(opts[:steer_comments])
+    comment_style_block = linear_comment_style_block()
     base_prompt = if turn_number == 1, do: PromptBuilder.build_prompt(issue, opts), else: continuation_prompt(turn_number, max_turns)
 
-    case steer_block do
-      nil -> base_prompt
-      block -> String.trim_trailing(base_prompt) <> "\n\n" <> block
-    end
+    [base_prompt, comment_style_block, steer_block]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n\n")
   end
 
   defp continuation_prompt(turn_number, max_turns) do
@@ -164,6 +176,19 @@ defmodule SymphonyElixir.AgentRunner do
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    """
+  end
+
+  defp linear_comment_style_block do
+    """
+    Linear comment guidance:
+
+    - Every assistant response in this run is mirrored into a Linear issue comment.
+    - Write in Japanese.
+    - Keep each response short and operator-friendly.
+    - Prefer 3 to 5 short bullet lines instead of long paragraphs.
+    - Use labels like `現在:`, `次:`, `差分:`, `確認:` when helpful.
+    - Do not paste long reasoning logs or repeated context into the response.
     """
   end
 
@@ -230,13 +255,22 @@ defmodule SymphonyElixir.AgentRunner do
   defp maybe_comment_turn_response(
          %Issue{id: issue_id} = issue,
          %{result: result} = turn_session,
+         workspace,
          turn_number,
          max_turns
        )
        when is_binary(issue_id) and is_integer(turn_number) and is_integer(max_turns) do
     case final_response_text(result) do
       response_text when is_binary(response_text) and response_text != "" ->
-        body = format_turn_response_comment(issue, turn_session, response_text, turn_number, max_turns)
+        body =
+          format_turn_response_comment(
+            issue,
+            turn_session,
+            response_text,
+            turn_number,
+            max_turns,
+            workspace
+          )
 
         case Tracker.create_comment(issue_id, body) do
           :ok ->
@@ -255,7 +289,8 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp maybe_comment_turn_response(_issue, _turn_session, _turn_number, _max_turns), do: :ok
+  defp maybe_comment_turn_response(_issue, _turn_session, _workspace, _turn_number, _max_turns),
+    do: :ok
 
   defp maybe_comment_partial_response(
          %Issue{id: issue_id} = issue,
@@ -270,7 +305,16 @@ defmodule SymphonyElixir.AgentRunner do
       response_text ->
         turn_number = Keyword.get(opts, :attempt, 0) + 1
         max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-        body = format_turn_response_comment(issue, %{session_id: nil}, response_text, turn_number, max_turns)
+
+        body =
+          format_turn_response_comment(
+            issue,
+            %{session_id: nil},
+            response_text,
+            turn_number,
+            max_turns,
+            opts[:workspace_path]
+          )
 
         case Tracker.create_comment(issue_id, body) do
           :ok -> :ok
@@ -290,23 +334,93 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp final_response_text(_result), do: nil
 
-  defp format_turn_response_comment(_issue, turn_session, response_text, turn_number, max_turns) do
-    session_suffix =
+  defp format_turn_response_comment(
+         _issue,
+         turn_session,
+         response_text,
+         turn_number,
+         max_turns,
+         workspace
+       ) do
+    session_lines =
       case turn_session[:session_id] do
         session_id when is_binary(session_id) and session_id != "" ->
-          "\nセッション: `#{session_id}`"
+          ["セッション: `#{session_id}`"]
 
         _ ->
-          ""
+          []
       end
+
+    diff_lines =
+      case workspace do
+        path when is_binary(path) and path != "" ->
+          ["差分確認: `cd #{path} && git diff --stat && git diff`"]
+
+        _ ->
+          []
+      end
+
+    bullet_lines =
+      ["ターン: #{turn_number}/#{max_turns}"] ++
+        session_lines ++
+        Enum.map(compact_linear_response_lines(response_text), &normalize_comment_bullet/1) ++
+        diff_lines
 
     """
     ## Codex 応答
 
-    ターン: #{turn_number}/#{max_turns}#{session_suffix}
-
-    #{response_text}
+    #{Enum.map_join(bullet_lines, "\n", &"- #{&1}")}
     """
+    |> String.trim()
+  end
+
+  defp compact_linear_response_lines(response_text) when is_binary(response_text) do
+    response_text
+    |> String.replace("\r\n", "\n")
+    |> String.trim()
+    |> String.split("\n")
+    |> Enum.flat_map(&split_comment_line/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> limit_linear_response_lines()
+  end
+
+  defp compact_linear_response_lines(_response_text), do: []
+
+  defp split_comment_line(line) when is_binary(line) do
+    trimmed = String.trim(line)
+
+    cond do
+      trimmed == "" ->
+        []
+
+      String.starts_with?(trimmed, ["- ", "* ", "現在:", "次:", "差分:", "確認:"]) ->
+        [trimmed]
+
+      true ->
+        Regex.split(~r/(?<=[。.!?！？])\s*/u, trimmed, trim: true)
+        |> case do
+          [] -> [trimmed]
+          sentences -> sentences
+        end
+    end
+  end
+
+  defp split_comment_line(_line), do: []
+
+  defp limit_linear_response_lines(lines) when is_list(lines) do
+    if length(lines) <= 4 do
+      lines
+    else
+      Enum.take(lines, 4)
+    end
+  end
+
+  defp normalize_comment_bullet(line) when is_binary(line) do
+    line
+    |> String.trim()
+    |> String.trim_leading("-")
+    |> String.trim_leading("*")
     |> String.trim()
   end
 
