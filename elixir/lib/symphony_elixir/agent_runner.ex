@@ -196,11 +196,11 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp format_start_comment(_issue, workspace, worker_host) do
     """
-    ## Codex Activity
+    ## Codex 作業開始
 
-    Started work on this issue.
-    Worker: `#{worker_host_for_log(worker_host)}`
-    Workspace: `#{workspace}`
+    この issue の作業を開始しました。
+    実行先: `#{worker_host_for_log(worker_host)}`
+    ワークスペース: `#{workspace}`
     """
     |> String.trim()
   end
@@ -248,16 +248,16 @@ defmodule SymphonyElixir.AgentRunner do
     session_suffix =
       case turn_session[:session_id] do
         session_id when is_binary(session_id) and session_id != "" ->
-          "\nSession: `#{session_id}`"
+          "\nセッション: `#{session_id}`"
 
         _ ->
           ""
       end
 
     """
-    ## Codex Final Response
+    ## Codex 最終回答
 
-    Turn: #{turn_number}/#{max_turns}#{session_suffix}
+    ターン: #{turn_number}/#{max_turns}#{session_suffix}
 
     #{final_response}
     """

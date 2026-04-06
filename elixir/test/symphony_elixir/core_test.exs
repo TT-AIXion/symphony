@@ -1249,13 +1249,13 @@ defmodule SymphonyElixir.CoreTest do
                )
 
       assert_receive {:memory_tracker_comment, "issue-final-comment", activity_body}, 1_000
-      assert activity_body =~ "## Codex Activity"
-      assert activity_body =~ "Started work on this issue."
+      assert activity_body =~ "## Codex 作業開始"
+      assert activity_body =~ "この issue の作業を開始しました。"
 
       assert_receive {:memory_tracker_comment, "issue-final-comment", body}, 1_000
-      assert body =~ "## Codex Final Response"
-      assert body =~ "Turn: 1/1"
-      assert body =~ "Session: `thread-comment-turn-comment`"
+      assert body =~ "## Codex 最終回答"
+      assert body =~ "ターン: 1/1"
+      assert body =~ "セッション: `thread-comment-turn-comment`"
       assert body =~ "Shipped the fix."
     after
       File.rm_rf(test_root)
@@ -1347,10 +1347,10 @@ defmodule SymphonyElixir.CoreTest do
 
       assert_receive {:memory_tracker_state_update, "issue-start-comment", "In Progress"}, 1_000
       assert_receive {:memory_tracker_comment, "issue-start-comment", body}, 1_000
-      assert body =~ "## Codex Activity"
-      assert body =~ "Started work on this issue."
-      assert body =~ "Worker: `local`"
-      assert body =~ "Workspace: `"
+      assert body =~ "## Codex 作業開始"
+      assert body =~ "この issue の作業を開始しました。"
+      assert body =~ "実行先: `local`"
+      assert body =~ "ワークスペース: `"
     after
       File.rm_rf(test_root)
     end
