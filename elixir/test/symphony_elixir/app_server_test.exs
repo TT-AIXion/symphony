@@ -407,7 +407,7 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
+      assert {:error, %{reason: %{type: :turn_input_required, payload: payload}}} =
                AppServer.run(workspace, "Needs input", issue)
 
       assert payload["method"] == "turn/input_required"
@@ -470,7 +470,7 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:approval_required, payload}} =
+      assert {:error, %{reason: %{type: :approval_required, payload: payload}}} =
                AppServer.run(workspace, "Handle approval request", issue)
 
       assert payload["method"] == "item/commandExecution/requestApproval"
@@ -947,8 +947,13 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, %{"method" => "mcpServer/elicitation/request"}}} =
-               AppServer.run(workspace, "Handle elicitation", issue)
+      assert {:error,
+              %{
+                reason: %{
+                  type: :turn_input_required,
+                  payload: %{"method" => "mcpServer/elicitation/request"}
+                }
+              }} = AppServer.run(workspace, "Handle elicitation", issue)
     after
       File.rm_rf(test_root)
     end

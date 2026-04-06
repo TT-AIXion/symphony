@@ -129,7 +129,14 @@ defmodule SymphonyElixir.Codex.AppServer do
               metadata
             )
 
-            {:error, reason}
+            {:error,
+             %{
+               reason: reason,
+               session_id: session_id,
+               thread_id: thread_id,
+               turn_id: turn_id,
+               partial_response: partial_response_from_reason(reason)
+             }}
         end
 
       {:error, reason} ->
@@ -469,7 +476,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        {:error,
+         %{
+           type: :turn_failed,
+           payload: Map.get(payload, "params"),
+           partial_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+         }}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
         emit_turn_event(
@@ -481,7 +493,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+        {:error,
+         %{
+           type: :turn_cancelled,
+           payload: Map.get(payload, "params"),
+           partial_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+         }}
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -592,7 +609,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        {:error, {:turn_input_required, payload}}
+        {:error,
+         %{
+           type: :turn_input_required,
+           payload: payload,
+           partial_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+         }}
 
       :approved ->
         receive_loop(
@@ -613,7 +635,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        {:error, {:approval_required, payload}}
+        {:error,
+         %{
+           type: :approval_required,
+           payload: payload,
+           partial_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+         }}
 
       :unhandled ->
         if needs_input?(method, payload) do
@@ -624,7 +651,12 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          {:error, {:turn_input_required, payload}}
+          {:error,
+           %{
+             type: :turn_input_required,
+             payload: payload,
+             partial_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+           }}
         else
           emit_message(
             on_message,
@@ -717,6 +749,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp normalize_final_response(_text), do: nil
+
+  defp partial_response_from_reason(%{partial_response: partial_response})
+       when is_binary(partial_response) do
+    normalize_final_response(partial_response)
+  end
+
+  defp partial_response_from_reason(_reason), do: nil
 
   defp extract_first_present(payload, paths) when is_map(payload) and is_list(paths) do
     Enum.find_value(paths, fn path ->

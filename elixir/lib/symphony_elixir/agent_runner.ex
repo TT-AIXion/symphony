@@ -38,10 +38,12 @@ defmodule SymphonyElixir.AgentRunner do
           try do
             with :ok <- Workspace.run_before_run_hook(codex_cwd, issue, worker_host) do
               case run_codex_turns(codex_cwd, prepared_issue, codex_update_recipient, opts, worker_host) do
-                {:error, {:turn_input_required, payload}} ->
+                {:error, %{reason: %{type: :turn_input_required, payload: payload} = reason}} ->
+                  maybe_comment_partial_response(prepared_issue, reason, opts)
                   handle_question_required(prepared_issue, payload)
 
-                {:error, {:approval_required, payload}} ->
+                {:error, %{reason: %{type: :approval_required, payload: payload} = reason}} ->
+                  maybe_comment_partial_response(prepared_issue, reason, opts)
                   handle_question_required(prepared_issue, payload)
 
                 other ->
@@ -255,6 +257,30 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp maybe_comment_turn_response(_issue, _turn_session, _turn_number, _max_turns), do: :ok
 
+  defp maybe_comment_partial_response(
+         %Issue{id: issue_id} = issue,
+         %{partial_response: partial_response},
+         opts
+       )
+       when is_binary(issue_id) and is_binary(partial_response) do
+    case String.trim(partial_response) do
+      "" ->
+        :ok
+
+      response_text ->
+        turn_number = Keyword.get(opts, :attempt, 0) + 1
+        max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+        body = format_turn_response_comment(issue, %{session_id: nil}, response_text, turn_number, max_turns)
+
+        case Tracker.create_comment(issue_id, body) do
+          :ok -> :ok
+          {:error, _reason} -> :ok
+        end
+    end
+  end
+
+  defp maybe_comment_partial_response(_issue, _reason, _opts), do: :ok
+
   defp final_response_text(%{final_response: final_response}) when is_binary(final_response) do
     case String.trim(final_response) do
       "" -> nil
@@ -311,12 +337,16 @@ defmodule SymphonyElixir.AgentRunner do
       extract_first_present(payload, [
         ["params", "question"],
         [:params, :question],
+        ["params", "message"],
+        [:params, :message],
         ["params", "prompt"],
         [:params, :prompt],
         ["params", "request", "question"],
         [:params, :request, :question],
         ["params", "questions", 0, "question"],
-        [:params, :questions, 0, :question]
+        [:params, :questions, 0, :question],
+        ["params", "_meta", "tool_title"],
+        [:params, :_meta, :tool_title]
       ]) || "追加の確認が必要です。"
 
     """
