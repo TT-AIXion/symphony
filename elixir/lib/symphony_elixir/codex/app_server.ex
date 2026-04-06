@@ -900,6 +900,50 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_handle_approval_request(
          port,
+         "mcpServer/elicitation/request",
+         %{"id" => id, "params" => params} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         auto_approve_requests
+       ) do
+    maybe_auto_answer_mcp_elicitation_request(
+      port,
+      id,
+      params,
+      payload,
+      payload_string,
+      on_message,
+      metadata,
+      auto_approve_requests
+    )
+  end
+
+  defp maybe_handle_approval_request(
+         port,
+         "mcp/elicitation/request",
+         %{"id" => id, "params" => params} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         auto_approve_requests
+       ) do
+    maybe_auto_answer_mcp_elicitation_request(
+      port,
+      id,
+      params,
+      payload,
+      payload_string,
+      on_message,
+      metadata,
+      auto_approve_requests
+    )
+  end
+
+  defp maybe_handle_approval_request(
+         port,
          "item/tool/requestUserInput",
          %{"id" => id, "params" => params} = payload,
          payload_string,
@@ -1061,6 +1105,64 @@ defmodule SymphonyElixir.Codex.AppServer do
       on_message,
       metadata
     )
+  end
+
+  defp maybe_auto_answer_mcp_elicitation_request(
+         port,
+         id,
+         params,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         true
+       ) do
+    case mcp_elicitation_auto_answer(params) do
+      {:ok, answer} ->
+        send_message(port, %{"id" => id, "result" => answer})
+
+        emit_message(
+          on_message,
+          :approval_auto_approved,
+          %{payload: payload, raw: payload_string, decision: "mcp_elicitation_auto_approved"},
+          metadata
+        )
+
+        :approved
+
+      :error ->
+        :input_required
+    end
+  end
+
+  defp maybe_auto_answer_mcp_elicitation_request(
+         _port,
+         _id,
+         _params,
+         _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         false
+       ) do
+    :input_required
+  end
+
+  defp mcp_elicitation_auto_answer(%{"requestedSchema" => schema}) when is_map(schema) do
+    case empty_object_schema?(schema) do
+      true -> {:ok, %{}}
+      false -> :error
+    end
+  end
+
+  defp mcp_elicitation_auto_answer(_params), do: {:ok, %{}}
+
+  defp empty_object_schema?(schema) when is_map(schema) do
+    type = Map.get(schema, "type") || Map.get(schema, :type)
+    properties = Map.get(schema, "properties") || Map.get(schema, :properties) || %{}
+    required = Map.get(schema, "required") || Map.get(schema, :required) || []
+
+    type == "object" and map_size(properties) == 0 and required in [[], nil]
   end
 
   defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
