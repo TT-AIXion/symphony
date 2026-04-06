@@ -22,6 +22,7 @@ description:
 
 - `gh` CLI is authenticated.
 - You are on the PR branch with a clean working tree.
+- Use `./scripts/with-gh-account.sh` for GitHub-backed `git` and `gh` commands in this repo.
 
 ## Steps
 
@@ -60,12 +61,12 @@ description:
 ```
 # Ensure branch and PR context
 branch=$(git branch --show-current)
-pr_number=$(gh pr view --json number -q .number)
-pr_title=$(gh pr view --json title -q .title)
-pr_body=$(gh pr view --json body -q .body)
+pr_number=$(./scripts/with-gh-account.sh gh pr view --json number -q .number)
+pr_title=$(./scripts/with-gh-account.sh gh pr view --json title -q .title)
+pr_body=$(./scripts/with-gh-account.sh gh pr view --json body -q .body)
 
 # Check mergeability and conflicts
-mergeable=$(gh pr view --json mergeable -q .mergeable)
+mergeable=$(./scripts/with-gh-account.sh gh pr view --json mergeable -q .mergeable)
 
 if [ "$mergeable" = "CONFLICTING" ]; then
   # Run the `pull` skill to handle fetch + merge + conflict resolution.
@@ -79,15 +80,15 @@ fi
 # with a `[codex]` issue comment acknowledging the findings and whether you're
 # addressing or deferring them.
 while true; do
-  gh api repos/{owner}/{repo}/issues/"$pr_number"/comments \
+  ./scripts/with-gh-account.sh gh api repos/{owner}/{repo}/issues/"$pr_number"/comments \
     --jq '.[] | select(.body | startswith("## Codex Review")) | .id' | rg -q '.' \
     && break
   sleep 10
 done
 
 # Watch checks
-if ! gh pr checks --watch; then
-  gh pr checks
+if ! ./scripts/with-gh-account.sh gh pr checks --watch; then
+  ./scripts/with-gh-account.sh gh pr checks
   # Identify failing run and inspect logs
   # gh run list --branch "$branch"
   # gh run view <run-id> --log
@@ -95,7 +96,7 @@ if ! gh pr checks --watch; then
 fi
 
 # Squash-merge (remote branches auto-delete on merge in this repo)
-gh pr merge --squash --subject "$pr_title" --body "$pr_body"
+./scripts/with-gh-account.sh gh pr merge --squash --subject "$pr_title" --body "$pr_body"
 ```
 
 ## Async Watch Helper
@@ -104,7 +105,7 @@ Preferred: use the asyncio watcher to monitor review comments, CI, and head
 updates in parallel:
 
 ```
-python3 .codex/skills/land/land_watch.py
+./scripts/with-gh-account.sh python3 .codex/skills/land/land_watch.py
 ```
 
 Exit codes:
@@ -151,15 +152,15 @@ Exit codes:
 - Use review comment endpoints (not issue comments) to find inline feedback:
   - List PR review comments:
     ```
-    gh api repos/{owner}/{repo}/pulls/<pr_number>/comments
+    ./scripts/with-gh-account.sh gh api repos/{owner}/{repo}/pulls/<pr_number>/comments
     ```
   - PR issue comments (top-level discussion):
     ```
-    gh api repos/{owner}/{repo}/issues/<pr_number>/comments
+    ./scripts/with-gh-account.sh gh api repos/{owner}/{repo}/issues/<pr_number>/comments
     ```
   - Reply to a specific review comment:
     ```
-    gh api -X POST /repos/{owner}/{repo}/pulls/<pr_number>/comments \
+    ./scripts/with-gh-account.sh gh api -X POST /repos/{owner}/{repo}/pulls/<pr_number>/comments \
       -f body='[codex] <response>' -F in_reply_to=<comment_id>
     ```
 - `in_reply_to` must be the numeric review comment id (e.g., `2710521800`), not

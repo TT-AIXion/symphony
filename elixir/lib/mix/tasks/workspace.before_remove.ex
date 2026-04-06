@@ -33,7 +33,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
         Mix.raise("Invalid option(s): #{inspect(invalid)}")
 
       true ->
-        repo = opts[:repo] || @default_repo
+        repo = opts[:repo] || current_repo() || @default_repo
         branch = opts[:branch] || current_branch()
 
         maybe_close_open_pull_requests(repo, branch)
@@ -58,6 +58,18 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
 
   defp gh_authenticated? do
     match?({:ok, _output}, run_command("gh", ["auth", "status"]))
+  end
+
+  defp current_repo do
+    case run_command("git", ["remote", "get-url", "origin"]) do
+      {:ok, output} ->
+        output
+        |> String.trim()
+        |> parse_repo_from_remote()
+
+      {:error, _reason} ->
+        nil
+    end
   end
 
   defp list_open_pull_request_numbers(repo, branch) do
@@ -126,15 +138,49 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
   end
 
   defp run_command(command, args) do
-    case System.find_executable(command) do
+    {executable, executable_args} = resolve_command(command)
+
+    case executable do
       nil ->
         {:error, {:enoent, ""}}
 
       path ->
-        case System.cmd(path, args, stderr_to_stdout: true) do
+        case System.cmd(path, executable_args ++ args, stderr_to_stdout: true) do
           {output, 0} -> {:ok, output}
           {output, status} -> {:error, {status, output}}
         end
+    end
+  end
+
+  defp resolve_command("gh") do
+    case gh_wrapper_path() do
+      nil ->
+        {System.find_executable("gh"), []}
+
+      wrapper ->
+        {wrapper, ["gh"]}
+    end
+  end
+
+  defp resolve_command(command) do
+    {System.find_executable(command), []}
+  end
+
+  defp gh_wrapper_path do
+    if Mix.env() == :test do
+      nil
+    else
+      path = Path.expand("../scripts/with-gh-account.sh", File.cwd!())
+      if File.regular?(path), do: path
+    end
+  end
+
+  defp parse_repo_from_remote(""), do: nil
+
+  defp parse_repo_from_remote(remote) when is_binary(remote) do
+    case Regex.run(~r/github\.com[:\/]([^\/]+\/[^\/]+?)(?:\.git)?$/, remote, capture: :all_but_first) do
+      [repo] -> repo
+      _ -> nil
     end
   end
 end

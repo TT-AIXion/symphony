@@ -12,26 +12,27 @@ description:
 ## Workflow
 
 1. Verify git status is clean or commit/stash changes before merging.
-2. Ensure rerere is enabled locally:
+2. Use `./scripts/with-gh-account.sh` for every GitHub-backed `git` command in this repo so operations run as `TT-AIXion` and the previous `gh` account is restored afterward.
+3. Ensure rerere is enabled locally:
    - `git config rerere.enabled true`
    - `git config rerere.autoupdate true`
-3. Confirm remotes and branches:
+4. Confirm remotes and branches:
    - Ensure the `origin` remote exists.
    - Ensure the current branch is the one to receive the merge.
-4. Fetch latest refs:
-   - `git fetch origin`
-5. Sync the remote feature branch first:
-   - `git pull --ff-only origin $(git branch --show-current)`
+5. Fetch latest refs:
+   - `./scripts/with-gh-account.sh git fetch origin`
+6. Sync the remote feature branch first:
+   - `./scripts/with-gh-account.sh git pull --ff-only origin $(git branch --show-current)`
    - This pulls branch updates made remotely (for example, a GitHub auto-commit)
      before merging `origin/main`.
-6. Merge in order:
+7. Merge in order:
    - Prefer `git -c merge.conflictstyle=zdiff3 merge origin/main` for clearer
      conflict context.
-7. If conflicts appear, resolve them (see conflict guidance below), then:
+8. If conflicts appear, resolve them (see conflict guidance below), then:
    - `git add <files>`
    - `git commit` (or `git merge --continue` if the merge is paused)
-8. Verify with project checks (follow repo policy in `AGENTS.md`).
-9. Summarize the merge:
+9. Verify with project checks (follow repo policy in `AGENTS.md`).
+10. Summarize the merge:
    - Call out the most challenging conflicts/files and how they were resolved.
    - Note any assumptions or follow-ups.
 

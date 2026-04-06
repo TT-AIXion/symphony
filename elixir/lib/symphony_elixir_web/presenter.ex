@@ -124,7 +124,16 @@ defmodule SymphonyElixirWeb.Presenter do
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
-      workspace_path: Map.get(entry, :workspace_path)
+      workspace_path: Map.get(entry, :workspace_path),
+      last_session_id: Map.get(entry, :last_session_id),
+      last_event: Map.get(entry, :last_codex_event),
+      last_message: summarize_message(Map.get(entry, :last_codex_message)),
+      last_event_at: iso8601(Map.get(entry, :last_codex_timestamp)),
+      tokens: %{
+        input_tokens: Map.get(entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(entry, :codex_total_tokens, 0)
+      }
     }
   end
 
@@ -153,7 +162,16 @@ defmodule SymphonyElixirWeb.Presenter do
       due_at: due_at_iso8601(retry.due_in_ms),
       error: retry.error,
       worker_host: Map.get(retry, :worker_host),
-      workspace_path: Map.get(retry, :workspace_path)
+      workspace_path: Map.get(retry, :workspace_path),
+      last_session_id: Map.get(retry, :last_session_id),
+      last_event: Map.get(retry, :last_codex_event),
+      last_message: summarize_message(Map.get(retry, :last_codex_message)),
+      last_event_at: iso8601(Map.get(retry, :last_codex_timestamp)),
+      tokens: %{
+        input_tokens: Map.get(retry, :codex_input_tokens, 0),
+        output_tokens: Map.get(retry, :codex_output_tokens, 0),
+        total_tokens: Map.get(retry, :codex_total_tokens, 0)
+      }
     }
   end
 

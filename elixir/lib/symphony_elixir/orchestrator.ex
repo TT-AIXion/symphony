@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RuntimeStateStore, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -65,9 +65,10 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_terminal_workspace_cleanup()
+    state = restore_persisted_runtime_state(state)
     state = schedule_tick(state, 0)
 
-    {:ok, state}
+    {:ok, persist_runtime_state(state)}
   end
 
   @impl true
@@ -85,7 +86,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+    {:noreply, persist_runtime_state(state)}
   end
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
@@ -103,7 +104,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     :ok = schedule_poll_cycle_start()
-    {:noreply, state}
+    {:noreply, persist_runtime_state(state)}
   end
 
   def handle_info(:run_poll_cycle, state) do
@@ -113,7 +114,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
-    {:noreply, state}
+    {:noreply, persist_runtime_state(state)}
   end
 
   def handle_info(
@@ -136,30 +137,39 @@ defmodule SymphonyElixir.Orchestrator do
 
               state
               |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              |> schedule_issue_retry(
+                issue_id,
+                1,
+                Map.merge(metadata_from_running_entry(running_entry), %{
+                  identifier: running_entry.identifier,
+                  delay_type: :continuation,
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                })
+              )
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              schedule_issue_retry(
+                state,
+                issue_id,
+                next_attempt,
+                Map.merge(metadata_from_running_entry(running_entry), %{
+                  identifier: running_entry.identifier,
+                  error: "agent exited: #{inspect(reason)}",
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                })
+              )
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
         notify_dashboard()
-        {:noreply, state}
+        {:noreply, persist_runtime_state(state)}
     end
   end
 
@@ -176,7 +186,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state |> Map.put(:running, Map.put(running, issue_id, updated_running_entry)) |> persist_runtime_state()}
     end
   end
 
@@ -197,7 +207,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_rate_limits(update)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state |> Map.put(:running, Map.put(running, issue_id, updated_running_entry)) |> persist_runtime_state()}
     end
   end
 
@@ -211,7 +221,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     notify_dashboard()
-    result
+    persist_reply_state(result)
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
@@ -477,10 +487,14 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
-        identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
-      })
+      |> schedule_issue_retry(
+        issue_id,
+        next_attempt,
+        Map.merge(metadata_from_running_entry(running_entry), %{
+          identifier: identifier,
+          error: "stalled for #{elapsed_ms}ms without codex activity"
+        })
+      )
     else
       state
     end
@@ -775,38 +789,62 @@ defmodule SymphonyElixir.Orchestrator do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
+    put_retry_entry(state, issue_id, next_attempt, delay_ms, metadata, previous_retry, true)
+  end
+
+  defp put_retry_entry(%State{} = state, issue_id, attempt, delay_ms, metadata, previous_retry, log_retry?)
+       when is_binary(issue_id) and is_integer(attempt) and attempt > 0 and
+              is_integer(delay_ms) and delay_ms >= 0 and is_map(metadata) and
+              is_map(previous_retry) do
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
-    identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
-    worker_host = pick_retry_worker_host(previous_retry, metadata)
-    workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    retry_entry = build_retry_entry(issue_id, attempt, due_at_ms, metadata, previous_retry, retry_token)
 
-    if is_reference(old_timer) do
-      Process.cancel_timer(old_timer)
-    end
-
+    cancel_retry_timer(old_timer)
     timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
 
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
-
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    log_retry_entry(issue_id, retry_entry, delay_ms, log_retry?)
 
     %{
       state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path
-          })
+      | retry_attempts: Map.put(state.retry_attempts, issue_id, Map.put(retry_entry, :timer_ref, timer_ref)),
+        claimed: MapSet.put(state.claimed, issue_id)
     }
+  end
+
+  defp build_retry_entry(issue_id, attempt, due_at_ms, metadata, previous_retry, retry_token) do
+    %{
+      attempt: attempt,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      identifier: pick_retry_identifier(issue_id, previous_retry, metadata),
+      error: pick_retry_error(previous_retry, metadata),
+      worker_host: pick_retry_worker_host(previous_retry, metadata),
+      workspace_path: pick_retry_workspace_path(previous_retry, metadata),
+      last_session_id: pick_retry_last_session_id(previous_retry, metadata),
+      last_codex_event: pick_retry_last_codex_event(previous_retry, metadata),
+      last_codex_timestamp: pick_retry_last_codex_timestamp(previous_retry, metadata),
+      last_codex_message: pick_retry_last_codex_message(previous_retry, metadata),
+      codex_input_tokens: pick_retry_codex_input_tokens(previous_retry, metadata),
+      codex_output_tokens: pick_retry_codex_output_tokens(previous_retry, metadata),
+      codex_total_tokens: pick_retry_codex_total_tokens(previous_retry, metadata)
+    }
+  end
+
+  defp cancel_retry_timer(old_timer) when is_reference(old_timer) do
+    Process.cancel_timer(old_timer)
+  end
+
+  defp cancel_retry_timer(_old_timer), do: :ok
+
+  defp log_retry_entry(_issue_id, _retry_entry, _delay_ms, false), do: :ok
+
+  defp log_retry_entry(issue_id, retry_entry, delay_ms, true) do
+    error = Map.get(retry_entry, :error)
+    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+
+    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{Map.get(retry_entry, :identifier)} in #{delay_ms}ms (attempt #{Map.get(retry_entry, :attempt)})#{error_suffix}")
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -816,7 +854,14 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          last_session_id: Map.get(retry_entry, :last_session_id),
+          last_codex_event: Map.get(retry_entry, :last_codex_event),
+          last_codex_timestamp: Map.get(retry_entry, :last_codex_timestamp),
+          last_codex_message: Map.get(retry_entry, :last_codex_message),
+          codex_input_tokens: Map.get(retry_entry, :codex_input_tokens),
+          codex_output_tokens: Map.get(retry_entry, :codex_output_tokens),
+          codex_total_tokens: Map.get(retry_entry, :codex_total_tokens)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -922,7 +967,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -964,11 +1013,53 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
 
+  defp pick_retry_last_session_id(previous_retry, metadata) do
+    metadata[:last_session_id] || metadata[:session_id] || Map.get(previous_retry, :last_session_id)
+  end
+
+  defp pick_retry_last_codex_event(previous_retry, metadata) do
+    metadata[:last_codex_event] || Map.get(previous_retry, :last_codex_event)
+  end
+
+  defp pick_retry_last_codex_timestamp(previous_retry, metadata) do
+    metadata[:last_codex_timestamp] || Map.get(previous_retry, :last_codex_timestamp)
+  end
+
+  defp pick_retry_last_codex_message(previous_retry, metadata) do
+    metadata[:last_codex_message] || Map.get(previous_retry, :last_codex_message)
+  end
+
+  defp pick_retry_codex_input_tokens(previous_retry, metadata) do
+    metadata[:codex_input_tokens] || Map.get(previous_retry, :codex_input_tokens, 0)
+  end
+
+  defp pick_retry_codex_output_tokens(previous_retry, metadata) do
+    metadata[:codex_output_tokens] || Map.get(previous_retry, :codex_output_tokens, 0)
+  end
+
+  defp pick_retry_codex_total_tokens(previous_retry, metadata) do
+    metadata[:codex_total_tokens] || Map.get(previous_retry, :codex_total_tokens, 0)
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
   end
+
+  defp metadata_from_running_entry(running_entry) when is_map(running_entry) do
+    %{
+      session_id: Map.get(running_entry, :session_id),
+      last_codex_event: Map.get(running_entry, :last_codex_event),
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      last_codex_message: Map.get(running_entry, :last_codex_message),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+    }
+  end
+
+  defp metadata_from_running_entry(_running_entry), do: %{}
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
     case Config.settings!().worker.ssh_hosts do
@@ -1109,7 +1200,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
-          state: metadata.issue.state,
+          state: metadata |> Map.get(:issue, %{}) |> Map.get(:state),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
@@ -1136,7 +1227,14 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          last_session_id: Map.get(retry, :last_session_id),
+          last_codex_event: Map.get(retry, :last_codex_event),
+          last_codex_timestamp: Map.get(retry, :last_codex_timestamp),
+          last_codex_message: Map.get(retry, :last_codex_message),
+          codex_input_tokens: Map.get(retry, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(retry, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(retry, :codex_total_tokens, 0)
         }
       end)
 
@@ -1652,4 +1750,220 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  defp persist_reply_state({:noreply, %State{} = state}), do: {:noreply, persist_runtime_state(state)}
+
+  defp persist_runtime_state(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+    now_unix_ms = System.system_time(:millisecond)
+
+    running =
+      Enum.map(state.running, fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          state: metadata |> Map.get(:issue, %{}) |> Map.get(:state),
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path),
+          session_id: Map.get(metadata, :session_id),
+          codex_app_server_pid: Map.get(metadata, :codex_app_server_pid),
+          codex_input_tokens: Map.get(metadata, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(metadata, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(metadata, :codex_total_tokens, 0),
+          retry_attempt: Map.get(metadata, :retry_attempt, 0),
+          turn_count: Map.get(metadata, :turn_count, 0),
+          started_at: Map.get(metadata, :started_at),
+          last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
+          last_codex_message: Map.get(metadata, :last_codex_message),
+          last_codex_event: Map.get(metadata, :last_codex_event)
+        }
+      end)
+
+    retrying =
+      Enum.map(state.retry_attempts, fn {issue_id, retry} ->
+        due_in_ms = max(0, Map.get(retry, :due_at_ms, now_ms) - now_ms)
+
+        %{
+          issue_id: issue_id,
+          attempt: Map.get(retry, :attempt, 1),
+          identifier: Map.get(retry, :identifier),
+          error: Map.get(retry, :error),
+          worker_host: Map.get(retry, :worker_host),
+          workspace_path: Map.get(retry, :workspace_path),
+          due_at_unix_ms: now_unix_ms + due_in_ms,
+          last_session_id: Map.get(retry, :last_session_id),
+          last_codex_event: Map.get(retry, :last_codex_event),
+          last_codex_timestamp: Map.get(retry, :last_codex_timestamp),
+          last_codex_message: Map.get(retry, :last_codex_message),
+          codex_input_tokens: Map.get(retry, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(retry, :codex_output_tokens, 0),
+          codex_total_tokens: Map.get(retry, :codex_total_tokens, 0)
+        }
+      end)
+
+    RuntimeStateStore.persist(%{
+      running: running,
+      retrying: retrying,
+      codex_totals: state.codex_totals,
+      rate_limits: state.codex_rate_limits
+    })
+
+    state
+  end
+
+  defp restore_persisted_runtime_state(%State{} = state) do
+    case RuntimeStateStore.load() do
+      {:ok, snapshot} ->
+        state
+        |> restore_codex_totals(snapshot[:codex_totals] || snapshot["codex_totals"])
+        |> restore_rate_limits(snapshot[:rate_limits] || snapshot["rate_limits"])
+        |> restore_retry_entries(snapshot[:retrying] || snapshot["retrying"] || [])
+        |> restore_running_entries(snapshot[:running] || snapshot["running"] || [])
+
+      {:error, reason} ->
+        Logger.warning("Failed to restore runtime state: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp restore_codex_totals(%State{} = state, %{} = codex_totals) do
+    %{state | codex_totals: normalize_codex_totals(codex_totals)}
+  end
+
+  defp restore_codex_totals(state, _codex_totals), do: state
+
+  defp restore_rate_limits(%State{} = state, %{} = rate_limits) do
+    %{state | codex_rate_limits: rate_limits}
+  end
+
+  defp restore_rate_limits(state, _rate_limits), do: state
+
+  defp restore_retry_entries(%State{} = state, retry_entries) when is_list(retry_entries) do
+    Enum.reduce(retry_entries, state, fn retry_entry, state_acc ->
+      restore_retry_entry(state_acc, retry_entry)
+    end)
+  end
+
+  defp restore_retry_entries(state, _retry_entries), do: state
+
+  defp restore_running_entries(%State{} = state, running_entries) when is_list(running_entries) do
+    Enum.reduce(running_entries, state, fn running_entry, state_acc ->
+      restore_running_entry(state_acc, running_entry)
+    end)
+  end
+
+  defp restore_running_entries(state, _running_entries), do: state
+
+  defp restore_retry_entry(%State{} = state, retry_entry) when is_map(retry_entry) do
+    issue_id = map_binary_value(retry_entry, ["issue_id", :issue_id])
+    attempt = integer_like(map_value_at(retry_entry, ["attempt", :attempt])) || 1
+
+    delay_ms =
+      retry_entry
+      |> map_value_at(["due_at_unix_ms", :due_at_unix_ms])
+      |> integer_like()
+      |> case do
+        due_at_unix_ms when is_integer(due_at_unix_ms) ->
+          max(0, due_at_unix_ms - System.system_time(:millisecond))
+
+        _ ->
+          0
+      end
+
+    if is_binary(issue_id) do
+      metadata = persisted_retry_metadata(retry_entry)
+      put_retry_entry(state, issue_id, attempt, delay_ms, metadata, %{}, false)
+    else
+      state
+    end
+  end
+
+  defp restore_retry_entry(state, _retry_entry), do: state
+
+  defp restore_running_entry(%State{} = state, running_entry) when is_map(running_entry) do
+    issue_id = map_binary_value(running_entry, ["issue_id", :issue_id])
+
+    if is_binary(issue_id) do
+      metadata =
+        running_entry
+        |> persisted_retry_metadata()
+        |> Map.put_new(:error, "restored after orchestrator restart")
+        |> Map.put_new(:identifier, map_binary_value(running_entry, ["identifier", :identifier]) || issue_id)
+
+      attempt =
+        running_entry
+        |> map_value_at(["retry_attempt", :retry_attempt])
+        |> integer_like()
+        |> case do
+          retry_attempt when is_integer(retry_attempt) and retry_attempt > 0 -> retry_attempt + 1
+          _ -> 1
+        end
+
+      put_retry_entry(state, issue_id, attempt, @continuation_retry_delay_ms, metadata, %{}, false)
+    else
+      state
+    end
+  end
+
+  defp restore_running_entry(state, _running_entry), do: state
+
+  defp persisted_retry_metadata(payload) when is_map(payload) do
+    %{
+      identifier: map_binary_value(payload, ["identifier", :identifier]),
+      error: map_binary_value(payload, ["error", :error]),
+      worker_host: map_binary_value(payload, ["worker_host", :worker_host]),
+      workspace_path: map_binary_value(payload, ["workspace_path", :workspace_path]),
+      last_session_id:
+        map_binary_value(payload, ["last_session_id", :last_session_id]) ||
+          map_binary_value(payload, ["session_id", :session_id]),
+      last_codex_event:
+        map_value_at(payload, ["last_codex_event", :last_codex_event]) ||
+          map_value_at(payload, ["last_event", :last_event]),
+      last_codex_timestamp:
+        parse_optional_datetime(
+          map_value_at(payload, ["last_codex_timestamp", :last_codex_timestamp]) ||
+            map_value_at(payload, ["last_event_at", :last_event_at]) ||
+            map_value_at(payload, ["started_at", :started_at])
+        ),
+      last_codex_message:
+        map_value_at(payload, ["last_codex_message", :last_codex_message]) ||
+          map_value_at(payload, ["last_message", :last_message]),
+      codex_input_tokens: integer_like(map_value_at(payload, ["codex_input_tokens", :codex_input_tokens])) || 0,
+      codex_output_tokens: integer_like(map_value_at(payload, ["codex_output_tokens", :codex_output_tokens])) || 0,
+      codex_total_tokens: integer_like(map_value_at(payload, ["codex_total_tokens", :codex_total_tokens])) || 0
+    }
+  end
+
+  defp normalize_codex_totals(codex_totals) when is_map(codex_totals) do
+    %{
+      input_tokens: integer_like(map_value_at(codex_totals, ["input_tokens", :input_tokens])) || 0,
+      output_tokens: integer_like(map_value_at(codex_totals, ["output_tokens", :output_tokens])) || 0,
+      total_tokens: integer_like(map_value_at(codex_totals, ["total_tokens", :total_tokens])) || 0,
+      seconds_running: integer_like(map_value_at(codex_totals, ["seconds_running", :seconds_running])) || 0
+    }
+  end
+
+  defp map_value_at(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.find_value(keys, fn key -> Map.get(payload, key) end)
+  end
+
+  defp map_value_at(_payload, _keys), do: nil
+
+  defp map_binary_value(payload, keys) do
+    case map_value_at(payload, keys) do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp parse_optional_datetime(%DateTime{} = datetime), do: datetime
+
+  defp parse_optional_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _ -> nil
+    end
+  end
+
+  defp parse_optional_datetime(_value), do: nil
 end

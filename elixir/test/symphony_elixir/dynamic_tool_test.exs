@@ -99,9 +99,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
-  test "linear_graphql passes multi-operation documents through unchanged" do
-    test_pid = self()
-
+  test "linear_graphql rejects multi-operation documents before calling Linear" do
     query = """
     query Viewer { viewer { id } }
     query Teams { teams { nodes { id } } }
@@ -111,15 +109,18 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       DynamicTool.execute(
         "linear_graphql",
         %{"query" => query},
-        linear_client: fn forwarded_query, variables, opts ->
-          send(test_pid, {:linear_client_called, forwarded_query, variables, opts})
-          {:ok, %{"errors" => [%{"message" => "Must provide operation name if query contains multiple operations."}]}}
+        linear_client: fn _forwarded_query, _variables, _opts ->
+          flunk("linear client should not be called when the query contains multiple operations")
         end
       )
 
-    assert_received {:linear_client_called, forwarded_query, %{}, []}
-    assert forwarded_query == String.trim(query)
     assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "`linear_graphql.query` must contain exactly one GraphQL operation."
+             }
+           }
   end
 
   test "linear_graphql rejects blank raw query strings even when using the default client" do

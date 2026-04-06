@@ -1223,6 +1223,9 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 
 - Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
   agent using tools defined by the workflow prompt.
+- Implementations may still expose tracker write helpers at the adapter boundary (for example
+  comment creation or issue-state updates) without making those writes part of orchestrator
+  business logic.
 - The service remains a scheduler/runner and tracker reader.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
@@ -1588,16 +1591,23 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
+Current design is intentionally in-memory for live scheduler state.
 
 After restart:
 
-- No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
+- No live worker process is assumed recoverable.
 - Service recovers by:
   - startup terminal workspace cleanup
   - fresh polling of active issues
   - re-dispatching eligible work
+
+Recommended extension:
+
+- Persist retry queue metadata, last known session metadata, and aggregate Codex accounting to a
+  local runtime state file under the configured logs root.
+- On restart, restore retry entries from that file using wall-clock due times.
+- Persisted running-session metadata may be converted into fresh retry attempts; the original live
+  worker process is still treated as non-recoverable.
 
 ### 14.4 Operator Intervention Points
 
@@ -2105,12 +2115,13 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
+- File-backed restart continuation for retry queue/session metadata while keeping live workers
+  non-recoverable.
+- Observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- Adapter-level tracker write helpers (comments/state transitions) without moving business logic out
+  of the workflow/agent layer.
+- Pluggable issue tracker adapters beyond Linear, such as in-memory or test-only adapters.
 
 ### 18.3 Operational Validation Before Production (Recommended)
 

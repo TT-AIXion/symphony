@@ -101,6 +101,112 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator restores persisted retry entries, restarted sessions, and codex totals on boot" do
+    state_file =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-runtime-state-#{System.unique_integer([:positive])}.json"
+      )
+
+    Application.put_env(:symphony_elixir, :runtime_state_file, state_file)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory"
+    )
+
+    assert :ok =
+             RuntimeStateStore.persist(%{
+               running: [
+                 %{
+                   issue_id: "issue-restored-running",
+                   identifier: "MT-777",
+                   state: "In Progress",
+                   worker_host: "worker-a",
+                   workspace_path: "/tmp/workspaces/MT-777",
+                   session_id: "thread-777-turn-1",
+                   codex_input_tokens: 13,
+                   codex_output_tokens: 8,
+                   codex_total_tokens: 21,
+                   retry_attempt: 2,
+                   started_at: DateTime.utc_now(),
+                   last_codex_timestamp: DateTime.utc_now(),
+                   last_codex_message: %{event: :notification, message: %{method: "thread/tokenUsage/updated"}},
+                   last_codex_event: :notification
+                 }
+               ],
+               retrying: [
+                 %{
+                   issue_id: "issue-restored-retry",
+                   attempt: 3,
+                   identifier: "MT-778",
+                   error: "retry me",
+                   worker_host: "worker-b",
+                   workspace_path: "/tmp/workspaces/MT-778",
+                   due_at_unix_ms: System.system_time(:millisecond) + 5_000,
+                   last_session_id: "thread-778-turn-2",
+                   last_codex_event: :turn_completed,
+                   last_codex_timestamp: DateTime.utc_now(),
+                   last_codex_message: %{event: :turn_completed, message: %{method: "turn/completed"}},
+                   codex_input_tokens: 5,
+                   codex_output_tokens: 3,
+                   codex_total_tokens: 8
+                 }
+               ],
+               codex_totals: %{
+                 input_tokens: 101,
+                 output_tokens: 202,
+                 total_tokens: 303,
+                 seconds_running: 404
+               },
+               rate_limits: %{
+                 "limit_id" => "primary",
+                 "primary" => %{"remaining" => 12},
+                 "secondary" => %{"remaining" => 6}
+               }
+             })
+
+    orchestrator_name = Module.concat(__MODULE__, :RestoredStateOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert snapshot.codex_totals == %{
+             input_tokens: 101,
+             output_tokens: 202,
+             total_tokens: 303,
+             seconds_running: 404
+           }
+
+    assert snapshot.rate_limits == %{
+             "limit_id" => "primary",
+             "primary" => %{"remaining" => 12},
+             "secondary" => %{"remaining" => 6}
+           }
+
+    assert Enum.any?(snapshot.retrying, fn entry ->
+             entry.issue_id == "issue-restored-running" and
+               entry.attempt == 3 and
+               entry.identifier == "MT-777" and
+               entry.last_session_id == "thread-777-turn-1" and
+               entry.codex_total_tokens == 21
+           end)
+
+    assert Enum.any?(snapshot.retrying, fn entry ->
+             entry.issue_id == "issue-restored-retry" and
+               entry.attempt == 3 and
+               entry.identifier == "MT-778" and
+               entry.last_session_id == "thread-778-turn-2" and
+               entry.codex_total_tokens == 8
+           end)
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

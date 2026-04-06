@@ -68,7 +68,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do
     case String.trim(arguments) do
       "" -> {:error, :missing_query}
-      query -> {:ok, query, %{}}
+      query -> validate_query_document(query, %{})
     end
   end
 
@@ -77,7 +77,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:ok, query} ->
         case normalize_variables(arguments) do
           {:ok, variables} ->
-            {:ok, query, variables}
+            validate_query_document(query, variables)
 
           {:error, reason} ->
             {:error, reason}
@@ -107,6 +107,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     case Map.get(arguments, "variables") || Map.get(arguments, :variables) || %{} do
       variables when is_map(variables) -> {:ok, variables}
       _ -> {:error, :invalid_variables}
+    end
+  end
+
+  defp validate_query_document(query, variables) when is_binary(query) and is_map(variables) do
+    case graphql_operation_count(query) do
+      1 -> {:ok, query, variables}
+      _ -> {:error, :invalid_query_document}
     end
   end
 
@@ -168,6 +175,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:invalid_query_document) do
+    %{
+      "error" => %{
+        "message" => "`linear_graphql.query` must contain exactly one GraphQL operation."
+      }
+    }
+  end
+
   defp tool_error_payload(:missing_linear_api_token) do
     %{
       "error" => %{
@@ -205,5 +220,104 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])
+  end
+
+  defp graphql_operation_count(query) when is_binary(query) do
+    query
+    |> String.to_charlist()
+    |> count_graphql_operations(0, :normal, 0, false)
+  end
+
+  defp count_graphql_operations([], _depth, _mode, count, _awaiting_body), do: count
+
+  defp count_graphql_operations([?# | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :comment, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?\n | rest], depth, :comment, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([_char | rest], depth, :comment, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :comment, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?", ?", ?" | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :block_string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?", ?", ?" | rest], depth, :block_string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?", ?", ?" | rest], depth, :string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?" | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?\\, _escaped | rest], depth, :string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?" | rest], depth, :string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([_char | rest], depth, :string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([_char | rest], depth, :block_string, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :block_string, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([char | rest], depth, :normal, count, awaiting_body)
+       when char in [?\s, ?\n, ?\r, ?\t, ?,] do
+    count_graphql_operations(rest, depth, :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?{ | rest], 0, :normal, count, true) do
+    count_graphql_operations(rest, 1, :normal, count, false)
+  end
+
+  defp count_graphql_operations([?{ | rest], 0, :normal, count, false) do
+    count_graphql_operations(rest, 1, :normal, count + 1, false)
+  end
+
+  defp count_graphql_operations([?{ | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, depth + 1, :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([?} | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, max(depth - 1, 0), :normal, count, awaiting_body)
+  end
+
+  defp count_graphql_operations([char | rest], 0, :normal, count, _awaiting_body)
+       when (char >= ?A and char <= ?Z) or (char >= ?a and char <= ?z) or char == ?_ do
+    {token, remainder} = take_identifier(rest, [char])
+
+    case token do
+      "query" -> count_graphql_operations(remainder, 0, :normal, count + 1, true)
+      "mutation" -> count_graphql_operations(remainder, 0, :normal, count + 1, true)
+      "subscription" -> count_graphql_operations(remainder, 0, :normal, count + 1, true)
+      _ -> count_graphql_operations(remainder, 0, :normal, count, true)
+    end
+  end
+
+  defp count_graphql_operations([_char | rest], depth, :normal, count, awaiting_body) do
+    count_graphql_operations(rest, depth, :normal, count, awaiting_body)
+  end
+
+  defp take_identifier([char | rest], acc)
+       when (char >= ?A and char <= ?Z) or (char >= ?a and char <= ?z) or
+              (char >= ?0 and char <= ?9) or char == ?_ do
+    take_identifier(rest, [char | acc])
+  end
+
+  defp take_identifier(rest, acc) do
+    {acc |> Enum.reverse() |> to_string(), rest}
   end
 end

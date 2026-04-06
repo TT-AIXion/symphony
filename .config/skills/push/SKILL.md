@@ -11,6 +11,7 @@ description:
 
 - `gh` CLI is installed and available in `PATH`.
 - `gh auth status` succeeds for GitHub operations in this repo.
+- Use `./scripts/with-gh-account.sh` for GitHub-backed `git` and `gh` commands in this repo.
 
 ## Goals
 
@@ -65,20 +66,20 @@ branch=$(git branch --show-current)
 make -C elixir all
 
 # Initial push: respect the current origin remote.
-git push -u origin HEAD
+./scripts/with-gh-account.sh git push -u origin HEAD
 
 # If that failed because the remote moved, use the pull skill. After
 # pull-skill resolution and re-validation, retry the normal push:
-git push -u origin HEAD
+./scripts/with-gh-account.sh git push -u origin HEAD
 
 # If the configured remote rejects the push for auth, permissions, or workflow
 # restrictions, stop and surface the exact error.
 
 # Only if history was rewritten locally:
-git push --force-with-lease origin HEAD
+./scripts/with-gh-account.sh git push --force-with-lease origin HEAD
 
 # Ensure a PR exists (create only if missing)
-pr_state=$(gh pr view --json state -q .state 2>/dev/null || true)
+pr_state=$(./scripts/with-gh-account.sh gh pr view --json state -q .state 2>/dev/null || true)
 if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
   echo "Current branch is tied to a closed PR; create a new branch + PR." >&2
   exit 1
@@ -87,10 +88,10 @@ fi
 # Write a clear, human-friendly title that summarizes the shipped change.
 pr_title="<clear PR title written for this change>"
 if [ -z "$pr_state" ]; then
-  gh pr create --title "$pr_title"
+  ./scripts/with-gh-account.sh gh pr create --title "$pr_title"
 else
   # Reconsider title on every branch update; edit if scope shifted.
-  gh pr edit --title "$pr_title"
+  ./scripts/with-gh-account.sh gh pr edit --title "$pr_title"
 fi
 
 # Write/edit PR body to match .github/pull_request_template.md before validation.
@@ -100,12 +101,12 @@ fi
 # 3) for branch updates, re-check that title/body still match current diff
 
 tmp_pr_body=$(mktemp)
-gh pr view --json body -q .body > "$tmp_pr_body"
+./scripts/with-gh-account.sh gh pr view --json body -q .body > "$tmp_pr_body"
 (cd elixir && mix pr_body.check --file "$tmp_pr_body")
 rm -f "$tmp_pr_body"
 
 # Show PR URL for the reply
-gh pr view --json url -q .url
+./scripts/with-gh-account.sh gh pr view --json url -q .url
 ```
 
 ## Notes

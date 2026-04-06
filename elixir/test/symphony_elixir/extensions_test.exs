@@ -366,6 +366,11 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
+                 "last_session_id" => nil,
+                 "last_event" => nil,
+                 "last_event_at" => nil,
+                 "last_message" => nil,
+                 "tokens" => %{"input_tokens" => 0, "output_tokens" => 0, "total_tokens" => 0},
                  "worker_host" => nil,
                  "workspace_path" => nil
                }
