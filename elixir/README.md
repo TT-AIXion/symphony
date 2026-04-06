@@ -241,6 +241,11 @@ The live test creates a temporary Linear project and issue, writes a temporary `
 a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
 Linear issue, then marks the project completed so the run remains visible in Linear.
 
+Successful Codex turns are also mirrored back to the current Linear issue as a `## Codex Final Response`
+comment using Symphony's configured tracker adapter. This gives operators a durable issue-thread
+record of the assistant's end-of-turn summary even when the workflow itself does not explicitly
+post one.
+
 ## FAQ
 
 ### Why Elixir?

@@ -42,6 +42,7 @@ defmodule SymphonyElixir.AgentRunner do
             Workspace.run_after_run_hook(codex_cwd, issue, worker_host)
           end
         end
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -100,6 +101,8 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
+      maybe_comment_final_response(issue, turn_session, turn_number, max_turns)
+
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
       case continue_with_issue?(issue, issue_state_fetcher) do
@@ -143,6 +146,65 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp maybe_comment_final_response(
+         %Issue{id: issue_id} = issue,
+         %{result: result} = turn_session,
+         turn_number,
+         max_turns
+       )
+       when is_binary(issue_id) and is_integer(turn_number) and is_integer(max_turns) do
+    case final_response_text(result) do
+      final_response when is_binary(final_response) and final_response != "" ->
+        body = format_final_response_comment(issue, turn_session, final_response, turn_number, max_turns)
+
+        case Tracker.create_comment(issue_id, body) do
+          :ok ->
+            Logger.info("Posted Linear final response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}")
+
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Failed to post Linear final response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}: #{inspect(reason)}")
+
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_comment_final_response(_issue, _turn_session, _turn_number, _max_turns), do: :ok
+
+  defp final_response_text(%{final_response: final_response}) when is_binary(final_response) do
+    case String.trim(final_response) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp final_response_text(_result), do: nil
+
+  defp format_final_response_comment(_issue, turn_session, final_response, turn_number, max_turns) do
+    session_suffix =
+      case turn_session[:session_id] do
+        session_id when is_binary(session_id) and session_id != "" ->
+          "\nSession: `#{session_id}`"
+
+        _ ->
+          ""
+      end
+
+    """
+    ## Codex Final Response
+
+    Turn: #{turn_number}/#{max_turns}#{session_suffix}
+
+    #{final_response}
+    """
+    |> String.trim()
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

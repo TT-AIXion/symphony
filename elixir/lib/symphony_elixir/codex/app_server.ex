@@ -391,15 +391,33 @@ defmodule SymphonyElixir.Codex.AppServer do
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      %{final_response: ""}
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         response_acc
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          response_acc
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -408,7 +426,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          response_acc
         )
 
       {^port, {:exit_status, status}} ->
@@ -419,13 +438,26 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(
+         port,
+         on_message,
+         data,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         response_acc
+       ) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+
+        {:ok,
+         %{
+           status: :turn_completed,
+           final_response: response_acc |> Map.get(:final_response, "") |> normalize_final_response()
+         }}
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -459,9 +491,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests
+          %{
+            timeout_ms: timeout_ms,
+            tool_executor: tool_executor,
+            auto_approve_requests: auto_approve_requests,
+            response_acc: accumulate_agent_response(response_acc, payload)
+          }
         )
 
       {:ok, payload} ->
@@ -475,7 +510,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          response_acc
+        )
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -492,7 +535,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          response_acc
+        )
     end
   end
 
@@ -515,10 +566,12 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload,
          payload_string,
          method,
-         timeout_ms,
-         tool_executor,
-         auto_approve_requests
+         turn_context
        ) do
+    timeout_ms = Map.fetch!(turn_context, :timeout_ms)
+    tool_executor = Map.fetch!(turn_context, :tool_executor)
+    auto_approve_requests = Map.fetch!(turn_context, :auto_approve_requests)
+    response_acc = Map.fetch!(turn_context, :response_acc)
     metadata = metadata_from_message(port, payload)
 
     case maybe_handle_approval_request(
@@ -542,7 +595,15 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          response_acc
+        )
 
       :approval_required ->
         emit_message(
@@ -576,10 +637,104 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+          receive_loop(
+            port,
+            on_message,
+            timeout_ms,
+            "",
+            tool_executor,
+            auto_approve_requests,
+            response_acc
+          )
         end
     end
   end
+
+  defp accumulate_agent_response(response_acc, payload) when is_map(response_acc) and is_map(payload) do
+    case extract_agent_response_text(payload) do
+      nil ->
+        response_acc
+
+      chunk ->
+        Map.update(response_acc, :final_response, chunk, &(&1 <> chunk))
+    end
+  end
+
+  defp accumulate_agent_response(response_acc, _payload), do: response_acc
+
+  defp extract_agent_response_text(%{"method" => method} = payload) when is_binary(method) do
+    if agent_response_method?(method) do
+      payload
+      |> extract_agent_response_text_from_payload()
+      |> sanitize_agent_response_chunk()
+    end
+  end
+
+  defp extract_agent_response_text(_payload), do: nil
+
+  defp agent_response_method?(method) do
+    method in [
+      "item/agentMessage/delta",
+      "item/agentMessage/contentDelta",
+      "codex/event/agent_message_delta",
+      "codex/event/agent_message_content_delta"
+    ]
+  end
+
+  defp extract_agent_response_text_from_payload(payload) do
+    extract_first_present(payload, [
+      ["params", "delta"],
+      [:params, :delta],
+      ["params", "textDelta"],
+      [:params, :textDelta],
+      ["params", "content"],
+      [:params, :content],
+      ["params", "msg", "payload", "delta"],
+      [:params, :msg, :payload, :delta],
+      ["params", "msg", "payload", "textDelta"],
+      [:params, :msg, :payload, :textDelta],
+      ["params", "msg", "content"],
+      [:params, :msg, :content],
+      ["params", "msg", "text"],
+      [:params, :msg, :text]
+    ])
+  end
+
+  defp sanitize_agent_response_chunk(text) when is_binary(text) do
+    case String.replace(text, "\r\n", "\n") do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp sanitize_agent_response_chunk(_text), do: nil
+
+  defp normalize_final_response(text) when is_binary(text) do
+    text
+    |> String.replace("\r\n", "\n")
+    |> String.trim()
+  end
+
+  defp normalize_final_response(_text), do: nil
+
+  defp extract_first_present(payload, paths) when is_map(payload) and is_list(paths) do
+    Enum.find_value(paths, fn path ->
+      app_server_map_path(payload, path)
+    end)
+  end
+
+  defp extract_first_present(_payload, _paths), do: nil
+
+  defp app_server_map_path(data, [key | rest]) when is_map(data) do
+    case Map.fetch(data, key) do
+      {:ok, value} when rest == [] -> value
+      {:ok, value} -> app_server_map_path(value, rest)
+      :error -> nil
+    end
+  end
+
+  defp app_server_map_path(_data, _path), do: nil
 
   defp maybe_handle_approval_request(
          port,

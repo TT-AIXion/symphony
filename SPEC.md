@@ -29,6 +29,9 @@ Important boundary:
 - Symphony is a scheduler/runner and tracker reader.
 - Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
   using tools available in the workflow/runtime environment.
+- Implementations may optionally mirror a completed Codex turn's final assistant response back to
+  the tracker as an issue comment, as long as this remains a transport/reporting concern rather
+  than workflow-specific business logic.
 - A successful run may end at a workflow-defined handoff state (for example `Human Review`), not
   necessarily `Done`.
 
@@ -1226,6 +1229,8 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 - Implementations may still expose tracker write helpers at the adapter boundary (for example
   comment creation or issue-state updates) without making those writes part of orchestrator
   business logic.
+- Implementations may also choose to post a successful turn's final assistant response back to the
+  tracker as an informational comment.
 - The service remains a scheduler/runner and tracker reader.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
