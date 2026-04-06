@@ -148,25 +148,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Path.expand(Config.settings!().workspace.root)
     expanded_root_prefix = expanded_root <> "/"
+    configured_cwd = Config.settings!().workspace.codex_cwd
 
-    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
-         {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
-      canonical_root_prefix = canonical_root <> "/"
+    case PathSafety.canonicalize(expanded_workspace) do
+      {:ok, canonical_workspace} ->
+        validate_local_workspace_cwd(
+          canonical_workspace,
+          expanded_workspace,
+          expanded_root,
+          expanded_root_prefix,
+          configured_cwd
+        )
 
-      cond do
-        canonical_workspace == canonical_root ->
-          {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
-
-        String.starts_with?(canonical_workspace <> "/", canonical_root_prefix) ->
-          {:ok, canonical_workspace}
-
-        String.starts_with?(expanded_workspace <> "/", expanded_root_prefix) ->
-          {:error, {:invalid_workspace_cwd, :symlink_escape, expanded_workspace, canonical_root}}
-
-        true ->
-          {:error, {:invalid_workspace_cwd, :outside_workspace_root, canonical_workspace, canonical_root}}
-      end
-    else
       {:error, {:path_canonicalize_failed, path, reason}} ->
         {:error, {:invalid_workspace_cwd, :path_unreadable, path, reason}}
     end
@@ -183,6 +176,71 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       true ->
         {:ok, workspace}
+    end
+  end
+
+  defp explicit_absolute_codex_cwd?(configured_cwd, canonical_workspace) when is_binary(configured_cwd) do
+    if Path.type(configured_cwd) == :absolute do
+      case PathSafety.canonicalize(Path.expand(configured_cwd)) do
+        {:ok, canonical_configured_cwd} -> canonical_configured_cwd == canonical_workspace
+        {:error, _reason} -> false
+      end
+    else
+      false
+    end
+  end
+
+  defp explicit_absolute_codex_cwd?(_configured_cwd, _canonical_workspace), do: false
+
+  defp validate_local_workspace_cwd(
+         canonical_workspace,
+         expanded_workspace,
+         expanded_root,
+         expanded_root_prefix,
+         configured_cwd
+       ) do
+    if explicit_absolute_codex_cwd?(configured_cwd, canonical_workspace) do
+      validate_explicit_codex_cwd(canonical_workspace)
+    else
+      validate_workspace_cwd_against_root(
+        canonical_workspace,
+        expanded_workspace,
+        expanded_root,
+        expanded_root_prefix
+      )
+    end
+  end
+
+  defp validate_explicit_codex_cwd(canonical_workspace) do
+    if File.dir?(canonical_workspace) do
+      {:ok, canonical_workspace}
+    else
+      {:error, {:invalid_workspace_cwd, :missing_directory, canonical_workspace}}
+    end
+  end
+
+  defp validate_workspace_cwd_against_root(
+         canonical_workspace,
+         expanded_workspace,
+         expanded_root,
+         expanded_root_prefix
+       ) do
+    with {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
+      canonical_root_prefix = canonical_root <> "/"
+
+      cond do
+        canonical_workspace == canonical_root ->
+          {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
+
+        String.starts_with?(canonical_workspace <> "/", canonical_root_prefix) ->
+          {:ok, canonical_workspace}
+
+        String.starts_with?(expanded_workspace <> "/", expanded_root_prefix) ->
+          {:error, {:invalid_workspace_cwd, :symlink_escape, expanded_workspace, canonical_root}}
+
+        true ->
+          {:error, {:invalid_workspace_cwd, :outside_workspace_root, canonical_workspace, canonical_root}}
+      end
     end
   end
 

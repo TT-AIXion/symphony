@@ -742,6 +742,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert config.workspace.codex_cwd == nil
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
@@ -910,7 +911,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     config = Config.settings!()
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
+    assert Config.codex_working_directory("/tmp/issue-workspace") == "/tmp/issue-workspace"
     assert config.codex.command == "#{codex_bin} app-server"
+  end
+
+  test "config resolves workspace codex cwd and workspace helper returns effective spawn cwd" do
+    project_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-codex-cwd-#{System.unique_integer([:positive])}"
+      )
+
+    issue_workspace = Path.join(project_root, "MT-CODEX")
+    nested_repo = Path.join(issue_workspace, "repo")
+
+    try do
+      File.mkdir_p!(nested_repo)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: project_root,
+        workspace_codex_cwd: "repo"
+      )
+
+      relative_cwd = Path.join(issue_workspace, "repo")
+
+      assert Config.settings!().workspace.codex_cwd == "repo"
+      assert Config.codex_working_directory(issue_workspace) == relative_cwd
+      assert {:ok, ^relative_cwd} = Workspace.codex_cwd(issue_workspace)
+
+      external_repo = Path.join(project_root, "external-repo")
+      File.mkdir_p!(external_repo)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: project_root,
+        workspace_codex_cwd: external_repo
+      )
+
+      expanded_external_repo = Path.expand(external_repo)
+
+      assert Config.settings!().workspace.codex_cwd == external_repo
+      assert Config.codex_working_directory(issue_workspace) == expanded_external_repo
+      assert {:ok, ^expanded_external_repo} = Workspace.codex_cwd(issue_workspace)
+    after
+      File.rm_rf(project_root)
+    end
   end
 
   test "config no longer resolves legacy env: references" do

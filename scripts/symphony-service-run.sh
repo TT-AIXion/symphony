@@ -16,6 +16,7 @@ token_file="$HOME/.config/symphony/linear_api_key"
 logs_root="$HOME/.local/state/symphony/$service_name"
 
 export PATH="$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$PATH"
+export SYMPHONY_HOME="$repo_root"
 
 if [[ ! -f "$token_file" ]]; then
   echo "missing Linear API key file: $token_file" >&2
@@ -33,6 +34,32 @@ if ! command -v mise >/dev/null 2>&1; then
 fi
 
 export LINEAR_API_KEY="$(<"$token_file")"
+
+configured_gh_user="$(
+  awk '
+    BEGIN { in_frontmatter = 0; in_github = 0 }
+    /^---$/ {
+      if (in_frontmatter == 0) {
+        in_frontmatter = 1
+        next
+      }
+
+      exit
+    }
+    in_frontmatter && /^github:[[:space:]]*$/ { in_github = 1; next }
+    in_frontmatter && /^[^[:space:]]/ { in_github = 0 }
+    in_frontmatter && in_github && /^[[:space:]]+account:[[:space:]]*/ {
+      sub(/^[[:space:]]+account:[[:space:]]*/, "")
+      gsub(/^["'\''"]|["'\''"]$/, "")
+      print
+      exit
+    }
+  ' "$workflow"
+)"
+
+if [[ -n "${configured_gh_user:-}" ]]; then
+  export SYMPHONY_GH_REQUIRED_USER="$configured_gh_user"
+fi
 
 mkdir -p "$logs_root"
 cd "$project_root"

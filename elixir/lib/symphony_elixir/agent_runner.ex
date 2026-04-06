@@ -31,16 +31,17 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        with {:ok, codex_cwd} <- Workspace.codex_cwd(workspace, worker_host) do
+          send_worker_runtime_info(codex_update_recipient, issue, worker_host, codex_cwd)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          try do
+            with :ok <- Workspace.run_before_run_hook(codex_cwd, issue, worker_host) do
+              run_codex_turns(codex_cwd, issue, codex_update_recipient, opts, worker_host)
+            end
+          after
+            Workspace.run_after_run_hook(codex_cwd, issue, worker_host)
           end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
         end
-
       {:error, reason} ->
         {:error, reason}
     end

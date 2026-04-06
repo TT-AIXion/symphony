@@ -12,6 +12,7 @@ log_file="$logs_root/update.log"
 mkdir -p "$logs_root"
 exec >>"$log_file" 2>&1
 export PATH="$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$PATH"
+export SYMPHONY_HOME="$repo_root"
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S'

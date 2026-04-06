@@ -86,6 +86,8 @@ What it does:
 - configures the LaunchAgent to execute `<clone>/scripts/symphony-service-run.sh`
 - configures the updater to run every 3 hours from the same clone, try `git pull --ff-only`, fall
   back to Codex + the `pull` skill if needed, rebuild, and restart the service
+- exports `SYMPHONY_HOME=<clone-root>` into the service environment
+- when workflow front matter contains `github.account`, exports it as `SYMPHONY_GH_REQUIRED_USER`
 
 Because the LaunchAgent points at the cloned repo path, updating that clone updates the service code
 used on the next restart or restart kick.
@@ -153,6 +155,13 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `workspace.codex_cwd` is an optional extension that changes the directory where Codex is spawned.
+  - Relative values are resolved from the issue workspace root.
+  - Absolute values are allowed for deliberate project-root execution, for example when the target
+    repository's own `.codex` directory must be loaded.
+- `github.account` is an optional extension for service-run environments. When present, the macOS
+  runner exports it as `SYMPHONY_GH_REQUIRED_USER` so workflow prompts can route GitHub operations
+  through `$SYMPHONY_HOME/scripts/with-gh-account.sh`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the

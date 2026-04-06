@@ -83,6 +83,25 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec codex_working_directory(Path.t() | nil) :: Path.t() | nil
+  def codex_working_directory(workspace \\ nil) do
+    configured_cwd = settings!().workspace.codex_cwd
+
+    cond do
+      is_nil(configured_cwd) ->
+        workspace
+
+      Path.type(configured_cwd) == :absolute ->
+        Path.expand(configured_cwd)
+
+      is_binary(workspace) ->
+        Path.expand(Path.join(workspace, configured_cwd))
+
+      true ->
+        Path.expand(configured_cwd)
+    end
+  end
+
   @spec server_port() :: non_neg_integer() | nil
   def server_port do
     case Application.get_env(:symphony_elixir, :server_port_override) do

@@ -207,6 +207,16 @@ defmodule SymphonyElixir.Workspace do
     String.replace(identifier || "issue", ~r/[^a-zA-Z0-9._-]/, "_")
   end
 
+  @spec codex_cwd(Path.t(), worker_host()) :: {:ok, Path.t()} | {:error, term()}
+  def codex_cwd(workspace, worker_host \\ nil) when is_binary(workspace) do
+    cwd = Config.codex_working_directory(workspace)
+
+    with {:ok, expanded_cwd} <- normalize_codex_cwd(cwd, worker_host),
+         :ok <- validate_codex_cwd(expanded_cwd, workspace, worker_host) do
+      {:ok, expanded_cwd}
+    end
+  end
+
   defp maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
     hooks = Config.settings!().hooks
 
@@ -455,6 +465,36 @@ defmodule SymphonyElixir.Workspace do
 
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
+
+  defp normalize_codex_cwd(cwd, nil) when is_binary(cwd) do
+    {:ok, Path.expand(cwd)}
+  end
+
+  defp normalize_codex_cwd(cwd, worker_host) when is_binary(cwd) and is_binary(worker_host) do
+    {:ok, cwd}
+  end
+
+  defp normalize_codex_cwd(cwd, _worker_host), do: {:error, {:invalid_codex_cwd, cwd}}
+
+  defp validate_codex_cwd(cwd, workspace, nil) when is_binary(cwd) and is_binary(workspace) do
+    configured_cwd = Config.settings!().workspace.codex_cwd
+
+    cond do
+      is_nil(configured_cwd) ->
+        validate_workspace_path(cwd, nil)
+
+      Path.type(configured_cwd) == :absolute ->
+        if File.dir?(cwd), do: :ok, else: {:error, {:codex_cwd_missing_directory, cwd}}
+
+      true ->
+        validate_workspace_path(cwd, nil)
+    end
+  end
+
+  defp validate_codex_cwd(cwd, _workspace, worker_host)
+       when is_binary(cwd) and is_binary(worker_host) do
+    validate_workspace_path(cwd, worker_host)
+  end
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     %{

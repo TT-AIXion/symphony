@@ -69,6 +69,10 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
+GitHub account policy:
+
+- If `SYMPHONY_GH_REQUIRED_USER` is set, use `$SYMPHONY_HOME/scripts/with-gh-account.sh` for GitHub-backed `git` and `gh` commands so the required account is used and the prior account is restored afterward.
+
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.

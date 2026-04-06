@@ -34,6 +34,9 @@ This repository contains the Symphony orchestration service and its language-agn
 ## Codebase-Specific Conventions
 
 - Runtime config is loaded from `WORKFLOW.md` front matter via `SymphonyElixir.Workflow` and `SymphonyElixir.Config`.
+- Useful workflow extensions:
+- `workspace.codex_cwd`: optional spawn cwd for Codex; may be relative to the issue workspace or an explicit absolute path.
+- `github.account`: optional GitHub account name exported as `SYMPHONY_GH_REQUIRED_USER` for service-run environments.
 - Keep the implementation aligned with `SPEC.md` where practical.
 - The implementation may be a superset of the spec.
 - The implementation must not conflict with the spec.
@@ -79,3 +82,5 @@ This repository contains the Symphony orchestration service and its language-agn
 - The updater should try a normal `git pull --ff-only` first.
 - If the normal pull fails, invoke Codex non-interactively to run the `pull` skill in the cloned repo.
 - After a successful update flow, rebuild the escript and restart the Symphony service.
+- macOS service runs export `SYMPHONY_HOME=<clone-root>`.
+- If a workflow front matter contains `github.account`, macOS service runs should export it as `SYMPHONY_GH_REQUIRED_USER`.
