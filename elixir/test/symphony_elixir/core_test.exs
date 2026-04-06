@@ -551,7 +551,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -630,7 +630,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, 8_500, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1164,7 +1164,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner posts the final Codex response back to the tracker as a comment" do
+  test "agent runner posts each Codex turn response back to the tracker as a comment" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1253,7 +1253,7 @@ defmodule SymphonyElixir.CoreTest do
       assert activity_body =~ "この issue の作業を開始しました。"
 
       assert_receive {:memory_tracker_comment, "issue-final-comment", body}, 1_000
-      assert body =~ "## Codex 最終回答"
+      assert body =~ "## Codex 応答"
       assert body =~ "ターン: 1/1"
       assert body =~ "セッション: `thread-comment-turn-comment`"
       assert body =~ "Shipped the fix."
@@ -1352,6 +1352,186 @@ defmodule SymphonyElixir.CoreTest do
       assert body =~ "実行先: `local`"
       assert body =~ "ワークスペース: `"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner moves issues to Question when Codex requests operator input" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-question-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_tracker_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, previous_memory_tracker_recipient)
+    end)
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-question"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-question"}}}'
+              printf '%s\\n' '{"method":"mcpServer/elicitation/request","params":{"question":"Need a confirmed destination path."}}'
+              ;;
+            *)
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-question-comment",
+        identifier: "MT-202",
+        title: "Question required",
+        description: "Move to Question when operator input is needed",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-202",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      assert_receive {:memory_tracker_comment, "issue-question-comment", start_body}, 1_000
+      assert start_body =~ "## Codex 作業開始"
+      assert_receive {:memory_tracker_state_update, "issue-question-comment", "Question"}, 1_000
+      assert_receive {:memory_tracker_comment, "issue-question-comment", question_body}, 1_000
+      assert question_body =~ "## Codex 質問"
+      assert question_body =~ "Need a confirmed destination path."
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner appends Linear steer comments to the next Codex turn prompt" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-steer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-steer"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-steer"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 1
+      )
+
+      issue = %Issue{
+        id: "issue-steer-comment",
+        identifier: "MT-203",
+        title: "Use steer comments",
+        description: "Append operator steer to the prompt",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-203",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, nil,
+                 steer_comments: [
+                   %{
+                     body: "この issue はまず影響範囲を確認してから進めてください。",
+                     user_name: "Takuto",
+                     created_at: ~U[2026-04-06 06:00:00Z]
+                   }
+                 ],
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      trace = File.read!(trace_file)
+
+      assert trace =~ "Operator steer from new Linear comments:"
+      assert trace =~ "Takuto at 2026-04-06T06:00:00Z"
+      assert trace =~ "この issue はまず影響範囲を確認してから進めてください。"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end

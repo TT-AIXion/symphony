@@ -32,12 +32,21 @@ defmodule SymphonyElixir.AgentRunner do
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
         with {:ok, codex_cwd} <- Workspace.codex_cwd(workspace, worker_host),
-             {:ok, prepared_issue} <- prepare_issue_for_execution(issue, codex_cwd, worker_host) do
+             {:ok, prepared_issue} <- prepare_issue_for_execution(issue, codex_cwd, worker_host, opts) do
           send_worker_runtime_info(codex_update_recipient, issue, worker_host, codex_cwd)
 
           try do
             with :ok <- Workspace.run_before_run_hook(codex_cwd, issue, worker_host) do
-              run_codex_turns(codex_cwd, prepared_issue, codex_update_recipient, opts, worker_host)
+              case run_codex_turns(codex_cwd, prepared_issue, codex_update_recipient, opts, worker_host) do
+                {:error, {:turn_input_required, payload}} ->
+                  handle_question_required(prepared_issue, payload)
+
+                {:error, {:approval_required, payload}} ->
+                  handle_question_required(prepared_issue, payload)
+
+                other ->
+                  other
+              end
             end
           after
             Workspace.run_after_run_hook(codex_cwd, issue, worker_host)
@@ -102,9 +111,8 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
-      maybe_comment_final_response(issue, turn_session, turn_number, max_turns)
-
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      maybe_comment_turn_response(issue, turn_session, turn_number, max_turns)
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -135,9 +143,17 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, turn_number, max_turns) do
+    steer_block = steer_comment_block(opts[:steer_comments])
+    base_prompt = if turn_number == 1, do: PromptBuilder.build_prompt(issue, opts), else: continuation_prompt(turn_number, max_turns)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+    case steer_block do
+      nil -> base_prompt
+      block -> String.trim_trailing(base_prompt) <> "\n\n" <> block
+    end
+  end
+
+  defp continuation_prompt(turn_number, max_turns) do
     """
     Continuation guidance:
 
@@ -149,14 +165,14 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp prepare_issue_for_execution(%Issue{} = issue, workspace, worker_host) when is_binary(workspace) do
+  defp prepare_issue_for_execution(%Issue{} = issue, workspace, worker_host, opts) when is_binary(workspace) do
     with {:ok, prepared_issue} <- ensure_issue_in_progress(issue) do
-      maybe_comment_start(prepared_issue, workspace, worker_host)
+      maybe_comment_start(prepared_issue, workspace, worker_host, opts)
       {:ok, prepared_issue}
     end
   end
 
-  defp prepare_issue_for_execution(issue, _workspace, _worker_host), do: {:ok, issue}
+  defp prepare_issue_for_execution(issue, _workspace, _worker_host, _opts), do: {:ok, issue}
 
   defp ensure_issue_in_progress(%Issue{id: issue_id, state: state_name} = issue)
        when is_binary(issue_id) and is_binary(state_name) do
@@ -177,22 +193,26 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp ensure_issue_in_progress(issue), do: {:ok, issue}
 
-  defp maybe_comment_start(%Issue{id: issue_id} = issue, workspace, worker_host)
+  defp maybe_comment_start(%Issue{id: issue_id} = issue, workspace, worker_host, opts)
        when is_binary(issue_id) and is_binary(workspace) do
-    body = format_start_comment(issue, workspace, worker_host)
+    if initial_attempt?(opts[:attempt]) do
+      body = format_start_comment(issue, workspace, worker_host)
 
-    case Tracker.create_comment(issue_id, body) do
-      :ok ->
-        Logger.info("Posted Linear activity comment for #{issue_context(issue)} workspace=#{workspace}")
-        :ok
+      case Tracker.create_comment(issue_id, body) do
+        :ok ->
+          Logger.info("Posted Linear activity comment for #{issue_context(issue)} workspace=#{workspace}")
+          :ok
 
-      {:error, reason} ->
-        Logger.warning("Failed to post Linear activity comment for #{issue_context(issue)} workspace=#{workspace}: #{inspect(reason)}")
-        :ok
+        {:error, reason} ->
+          Logger.warning("Failed to post Linear activity comment for #{issue_context(issue)} workspace=#{workspace}: #{inspect(reason)}")
+          :ok
+      end
+    else
+      :ok
     end
   end
 
-  defp maybe_comment_start(_issue, _workspace, _worker_host), do: :ok
+  defp maybe_comment_start(_issue, _workspace, _worker_host, _opts), do: :ok
 
   defp format_start_comment(_issue, workspace, worker_host) do
     """
@@ -205,7 +225,7 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.trim()
   end
 
-  defp maybe_comment_final_response(
+  defp maybe_comment_turn_response(
          %Issue{id: issue_id} = issue,
          %{result: result} = turn_session,
          turn_number,
@@ -213,17 +233,17 @@ defmodule SymphonyElixir.AgentRunner do
        )
        when is_binary(issue_id) and is_integer(turn_number) and is_integer(max_turns) do
     case final_response_text(result) do
-      final_response when is_binary(final_response) and final_response != "" ->
-        body = format_final_response_comment(issue, turn_session, final_response, turn_number, max_turns)
+      response_text when is_binary(response_text) and response_text != "" ->
+        body = format_turn_response_comment(issue, turn_session, response_text, turn_number, max_turns)
 
         case Tracker.create_comment(issue_id, body) do
           :ok ->
-            Logger.info("Posted Linear final response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}")
+            Logger.info("Posted Linear turn response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}")
 
             :ok
 
           {:error, reason} ->
-            Logger.warning("Failed to post Linear final response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}: #{inspect(reason)}")
+            Logger.warning("Failed to post Linear turn response comment for #{issue_context(issue)} session_id=#{turn_session[:session_id]} turn=#{turn_number}/#{max_turns}: #{inspect(reason)}")
 
             :ok
         end
@@ -233,7 +253,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp maybe_comment_final_response(_issue, _turn_session, _turn_number, _max_turns), do: :ok
+  defp maybe_comment_turn_response(_issue, _turn_session, _turn_number, _max_turns), do: :ok
 
   defp final_response_text(%{final_response: final_response}) when is_binary(final_response) do
     case String.trim(final_response) do
@@ -244,7 +264,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp final_response_text(_result), do: nil
 
-  defp format_final_response_comment(_issue, turn_session, final_response, turn_number, max_turns) do
+  defp format_turn_response_comment(_issue, turn_session, response_text, turn_number, max_turns) do
     session_suffix =
       case turn_session[:session_id] do
         session_id when is_binary(session_id) and session_id != "" ->
@@ -255,14 +275,137 @@ defmodule SymphonyElixir.AgentRunner do
       end
 
     """
-    ## Codex 最終回答
+    ## Codex 応答
 
     ターン: #{turn_number}/#{max_turns}#{session_suffix}
 
-    #{final_response}
+    #{response_text}
     """
     |> String.trim()
   end
+
+  defp handle_question_required(%Issue{id: issue_id} = issue, payload) when is_binary(issue_id) do
+    with :ok <- Tracker.update_issue_state(issue_id, "Question") do
+      body = format_question_comment(issue, payload)
+
+      case Tracker.create_comment(issue_id, body) do
+        :ok ->
+          Logger.info("Moved issue to Question after input was required for #{issue_context(issue)}")
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Failed to post Question comment for #{issue_context(issue)}: #{inspect(reason)}")
+          :ok
+      end
+    else
+      {:error, reason} ->
+        Logger.warning("Failed to move issue to Question for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, {:issue_state_transition_failed, reason}}
+    end
+  end
+
+  defp handle_question_required(_issue, _payload), do: :ok
+
+  defp format_question_comment(_issue, payload) do
+    question =
+      extract_first_present(payload, [
+        ["params", "question"],
+        [:params, :question],
+        ["params", "prompt"],
+        [:params, :prompt],
+        ["params", "request", "question"],
+        [:params, :request, :question],
+        ["params", "questions", 0, "question"],
+        [:params, :questions, 0, :question]
+      ]) || "追加の確認が必要です。"
+
+    """
+    ## Codex 質問
+
+    作業を進める前に確認したいことがあります。
+
+    #{question}
+
+    回答後に issue を `Todo` または `In Progress` に戻すと再開します。
+    """
+    |> String.trim()
+  end
+
+  defp steer_comment_block(nil), do: nil
+
+  defp steer_comment_block(comments) when is_list(comments) do
+    lines =
+      comments
+      |> Enum.map(&format_steer_comment/1)
+      |> Enum.reject(&is_nil/1)
+
+    case lines do
+      [] ->
+        nil
+
+      entries ->
+        """
+        Operator steer from new Linear comments:
+
+        #{Enum.join(entries, "\n\n")}
+
+        Treat the steer comments above as the newest operator instructions for this issue.
+        """
+        |> String.trim()
+    end
+  end
+
+  defp steer_comment_block(_comments), do: nil
+
+  defp format_steer_comment(%{body: body} = comment) when is_binary(body) do
+    author =
+      case comment[:user_name] do
+        name when is_binary(name) and name != "" -> name
+        _ -> "unknown"
+      end
+
+    timestamp =
+      case comment[:created_at] do
+        %DateTime{} = created_at -> " at #{DateTime.to_iso8601(created_at)}"
+        _ -> ""
+      end
+
+    "- #{author}#{timestamp}\n#{String.trim(body)}"
+  end
+
+  defp format_steer_comment(body) when is_binary(body) do
+    "- #{String.trim(body)}"
+  end
+
+  defp format_steer_comment(_comment), do: nil
+
+  defp initial_attempt?(attempt) when is_integer(attempt), do: attempt <= 0
+  defp initial_attempt?(nil), do: true
+  defp initial_attempt?(_attempt), do: false
+
+  defp extract_first_present(payload, paths) when is_map(payload) and is_list(paths) do
+    Enum.find_value(paths, fn path -> map_path(payload, path) end)
+  end
+
+  defp extract_first_present(_payload, _paths), do: nil
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    case Map.fetch(data, key) do
+      {:ok, value} when rest == [] -> value
+      {:ok, value} -> map_path(value, rest)
+      :error -> nil
+    end
+  end
+
+  defp map_path(data, [index | rest]) when is_list(data) and is_integer(index) do
+    case Enum.at(data, index) do
+      nil -> nil
+      value when rest == [] -> value
+      value -> map_path(value, rest)
+    end
+  end
+
+  defp map_path(_data, _path), do: nil
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

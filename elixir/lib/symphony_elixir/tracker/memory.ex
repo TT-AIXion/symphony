@@ -35,6 +35,27 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issue_comments_by_ids([String.t()]) :: {:ok, %{optional(String.t()) => [map()]}} | {:error, term()}
+  def fetch_issue_comments_by_ids(issue_ids) do
+    configured_comments =
+      Application.get_env(:symphony_elixir, :memory_tracker_comments, %{})
+
+    issue_map =
+      issue_ids
+      |> Enum.uniq()
+      |> Map.new(fn issue_id ->
+        comments =
+          case Map.get(configured_comments, issue_id, []) do
+            list when is_list(list) -> list
+            _ -> []
+          end
+
+        {issue_id, comments}
+      end)
+
+    {:ok, issue_map}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})

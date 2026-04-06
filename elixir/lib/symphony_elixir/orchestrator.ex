@@ -233,6 +233,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
+    state = reconcile_tracker_comments(state)
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -304,6 +305,124 @@ defmodule SymphonyElixir.Orchestrator do
 
           state
       end
+    end
+  end
+
+  defp reconcile_tracker_comments(%State{} = state) do
+    watched_issue_ids =
+      state.running
+      |> Map.keys()
+      |> Kernel.++(Map.keys(state.retry_attempts))
+      |> Enum.uniq()
+
+    case watched_issue_ids do
+      [] ->
+        state
+
+      issue_ids ->
+        case Tracker.fetch_issue_comments_by_ids(issue_ids) do
+          {:ok, comments_by_issue} when is_map(comments_by_issue) ->
+            Enum.reduce(issue_ids, state, fn issue_id, state_acc ->
+              reconcile_issue_comments(state_acc, issue_id, Map.get(comments_by_issue, issue_id, []))
+            end)
+
+          {:error, reason} ->
+            Logger.debug("Failed to refresh tracker comments: #{inspect(reason)}")
+            state
+        end
+    end
+  end
+
+  defp reconcile_issue_comments(%State{} = state, issue_id, comments) when is_binary(issue_id) and is_list(comments) do
+    cond do
+      Map.has_key?(state.running, issue_id) ->
+        reconcile_running_issue_comments(state, issue_id, comments)
+
+      Map.has_key?(state.retry_attempts, issue_id) ->
+        reconcile_retry_issue_comments(state, issue_id, comments)
+
+      true ->
+        state
+    end
+  end
+
+  defp reconcile_issue_comments(state, _issue_id, _comments), do: state
+
+  defp reconcile_running_issue_comments(%State{} = state, issue_id, comments) do
+    running_entry = Map.fetch!(state.running, issue_id)
+    new_comments = new_tracker_comments(comments, running_entry)
+
+    case new_comments do
+      [] ->
+        state
+
+      _ ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        merged_seen_ids = merge_seen_tracker_comment_ids(running_entry[:seen_tracker_comment_ids], new_comments)
+        comment_cursor_at = newest_tracker_comment_timestamp(new_comments) || Map.get(running_entry, :comment_cursor_at)
+        pending_steer_comments = Enum.map(new_comments, &format_steer_comment/1)
+
+        Logger.info("Steering active issue from new Linear comments: issue_id=#{issue_id} issue_identifier=#{identifier} comment_count=#{length(new_comments)}")
+
+        state
+        |> terminate_running_issue(issue_id, false)
+        |> schedule_issue_retry(
+          issue_id,
+          1,
+          Map.merge(metadata_from_running_entry(running_entry), %{
+            identifier: identifier,
+            delay_type: :continuation,
+            error: "steered by Linear comment",
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            comment_cursor_at: comment_cursor_at,
+            seen_tracker_comment_ids: merged_seen_ids,
+            pending_steer_comments: pending_steer_comments
+          })
+        )
+    end
+  end
+
+  defp reconcile_retry_issue_comments(%State{} = state, issue_id, comments) do
+    retry_entry = Map.fetch!(state.retry_attempts, issue_id)
+    new_comments = new_tracker_comments(comments, retry_entry)
+
+    case new_comments do
+      [] ->
+        state
+
+      _ ->
+        identifier = Map.get(retry_entry, :identifier, issue_id)
+        merged_seen_ids = merge_seen_tracker_comment_ids(retry_entry[:seen_tracker_comment_ids], new_comments)
+        comment_cursor_at = newest_tracker_comment_timestamp(new_comments) || Map.get(retry_entry, :comment_cursor_at)
+
+        pending_steer_comments =
+          Map.get(retry_entry, :pending_steer_comments, []) ++ Enum.map(new_comments, &format_steer_comment/1)
+
+        Logger.info("Steering queued issue from new Linear comments: issue_id=#{issue_id} issue_identifier=#{identifier} comment_count=#{length(new_comments)}")
+
+        schedule_issue_retry(
+          state,
+          issue_id,
+          Map.get(retry_entry, :attempt, 1),
+          %{
+            identifier: identifier,
+            delay_type: :continuation,
+            error: "steered by Linear comment",
+            worker_host: Map.get(retry_entry, :worker_host),
+            workspace_path: Map.get(retry_entry, :workspace_path),
+            last_session_id: Map.get(retry_entry, :last_session_id),
+            last_codex_event: Map.get(retry_entry, :last_codex_event),
+            last_codex_timestamp: Map.get(retry_entry, :last_codex_timestamp),
+            last_codex_message: Map.get(retry_entry, :last_codex_message),
+            codex_input_tokens: Map.get(retry_entry, :codex_input_tokens, 0),
+            codex_output_tokens: Map.get(retry_entry, :codex_output_tokens, 0),
+            codex_total_tokens: Map.get(retry_entry, :codex_total_tokens, 0),
+            comment_cursor_at: comment_cursor_at,
+            seen_tracker_comment_ids: merged_seen_ids,
+            pending_steer_comments: pending_steer_comments
+          }
+        )
     end
   end
 
@@ -671,10 +790,10 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil, run_metadata \\ %{}) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, run_metadata)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -691,7 +810,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, run_metadata) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -700,13 +819,23 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, run_metadata)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, run_metadata) do
+    steer_comments =
+      case run_metadata[:pending_steer_comments] do
+        comments when is_list(comments) -> comments
+        _ -> []
+      end
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             steer_comments: steer_comments
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -733,6 +862,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
+            comment_cursor_at: run_metadata[:comment_cursor_at] || DateTime.utc_now(),
+            seen_tracker_comment_ids: run_metadata[:seen_tracker_comment_ids] || [],
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -828,7 +959,10 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_message: pick_retry_last_codex_message(previous_retry, metadata),
       codex_input_tokens: pick_retry_codex_input_tokens(previous_retry, metadata),
       codex_output_tokens: pick_retry_codex_output_tokens(previous_retry, metadata),
-      codex_total_tokens: pick_retry_codex_total_tokens(previous_retry, metadata)
+      codex_total_tokens: pick_retry_codex_total_tokens(previous_retry, metadata),
+      comment_cursor_at: pick_retry_comment_cursor_at(previous_retry, metadata),
+      seen_tracker_comment_ids: pick_retry_seen_tracker_comment_ids(previous_retry, metadata),
+      pending_steer_comments: pick_retry_pending_steer_comments(previous_retry, metadata)
     }
   end
 
@@ -861,7 +995,10 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_message: Map.get(retry_entry, :last_codex_message),
           codex_input_tokens: Map.get(retry_entry, :codex_input_tokens),
           codex_output_tokens: Map.get(retry_entry, :codex_output_tokens),
-          codex_total_tokens: Map.get(retry_entry, :codex_total_tokens)
+          codex_total_tokens: Map.get(retry_entry, :codex_total_tokens),
+          comment_cursor_at: Map.get(retry_entry, :comment_cursor_at),
+          seen_tracker_comment_ids: Map.get(retry_entry, :seen_tracker_comment_ids, []),
+          pending_steer_comments: Map.get(retry_entry, :pending_steer_comments, [])
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -949,7 +1086,7 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host], metadata)}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -1041,11 +1178,106 @@ defmodule SymphonyElixir.Orchestrator do
     metadata[:codex_total_tokens] || Map.get(previous_retry, :codex_total_tokens, 0)
   end
 
+  defp pick_retry_comment_cursor_at(previous_retry, metadata) do
+    metadata[:comment_cursor_at] || Map.get(previous_retry, :comment_cursor_at)
+  end
+
+  defp pick_retry_seen_tracker_comment_ids(previous_retry, metadata) do
+    metadata[:seen_tracker_comment_ids] || Map.get(previous_retry, :seen_tracker_comment_ids, [])
+  end
+
+  defp pick_retry_pending_steer_comments(previous_retry, metadata) do
+    metadata[:pending_steer_comments] || Map.get(previous_retry, :pending_steer_comments, [])
+  end
+
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
   end
+
+  defp new_tracker_comments(comments, entry) when is_list(comments) and is_map(entry) do
+    seen_ids = Map.get(entry, :seen_tracker_comment_ids, [])
+    cursor_at = Map.get(entry, :comment_cursor_at)
+
+    Enum.filter(comments, fn comment ->
+      tracker_comment_candidate?(comment, seen_ids, cursor_at)
+    end)
+  end
+
+  defp new_tracker_comments(_comments, _entry), do: []
+
+  defp tracker_comment_candidate?(%{id: id, body: body} = comment, seen_ids, cursor_at)
+       when is_binary(body) and is_list(seen_ids) do
+    not codex_generated_comment?(body) and
+      (is_nil(id) or id not in seen_ids) and
+      tracker_comment_after_cursor?(comment, cursor_at)
+  end
+
+  defp tracker_comment_candidate?(_comment, _seen_ids, _cursor_at), do: false
+
+  defp tracker_comment_after_cursor?(%{created_at: %DateTime{} = created_at}, %DateTime{} = cursor_at) do
+    DateTime.compare(created_at, cursor_at) == :gt
+  end
+
+  defp tracker_comment_after_cursor?(comment, cursor_at) when is_binary(cursor_at) do
+    case DateTime.from_iso8601(cursor_at) do
+      {:ok, datetime, _offset} -> tracker_comment_after_cursor?(comment, datetime)
+      _ -> true
+    end
+  end
+
+  defp tracker_comment_after_cursor?(%{created_at: %DateTime{}}, nil), do: true
+  defp tracker_comment_after_cursor?(%{created_at: nil}, _cursor_at), do: true
+  defp tracker_comment_after_cursor?(_comment, _cursor_at), do: false
+
+  defp codex_generated_comment?(body) when is_binary(body) do
+    String.starts_with?(String.trim_leading(body), "## Codex ")
+  end
+
+  defp codex_generated_comment?(_body), do: false
+
+  defp merge_seen_tracker_comment_ids(existing_ids, comments) when is_list(comments) do
+    new_ids =
+      comments
+      |> Enum.map(&Map.get(&1, :id))
+      |> Enum.filter(&is_binary/1)
+
+    (existing_ids || [])
+    |> Kernel.++(new_ids)
+    |> Enum.uniq()
+    |> Enum.take(-50)
+  end
+
+  defp newest_tracker_comment_timestamp(comments) when is_list(comments) do
+    comments
+    |> Enum.map(&Map.get(&1, :created_at))
+    |> Enum.filter(&match?(%DateTime{}, &1))
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+  end
+
+  defp format_steer_comment(%{body: body} = comment) when is_binary(body) do
+    author =
+      case Map.get(comment, :user_name) do
+        name when is_binary(name) and name != "" -> name
+        _ -> "unknown"
+      end
+
+    timestamp =
+      case Map.get(comment, :created_at) do
+        %DateTime{} = created_at -> " at #{DateTime.to_iso8601(created_at)}"
+        _ -> ""
+      end
+
+    %{
+      author: author,
+      body: String.trim(body),
+      created_at: Map.get(comment, :created_at),
+      text: "- #{author}#{timestamp}\n#{String.trim(body)}"
+    }
+  end
+
+  defp format_steer_comment(comment), do: comment
 
   defp metadata_from_running_entry(running_entry) when is_map(running_entry) do
     %{
@@ -1055,7 +1287,9 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_message: Map.get(running_entry, :last_codex_message),
       codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
       codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
-      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      comment_cursor_at: Map.get(running_entry, :comment_cursor_at),
+      seen_tracker_comment_ids: Map.get(running_entry, :seen_tracker_comment_ids, [])
     }
   end
 

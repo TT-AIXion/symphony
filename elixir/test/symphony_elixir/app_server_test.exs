@@ -891,6 +891,69 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server surfaces mcp elicitation requests as input required" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-elicitation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-720")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-720"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-720"}}}'
+            printf '%s\\n' '{"method":"mcpServer/elicitation/request","params":{"question":"Need confirmation from the operator before continuing."}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-elicitation",
+        identifier: "MT-720",
+        title: "Surface mcp elicitation",
+        description: "Ensure elicitation requests stop the turn",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-720",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:turn_input_required, %{"method" => "mcpServer/elicitation/request"}}} =
+               AppServer.run(workspace, "Handle elicitation", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects unsupported dynamic tool calls without stalling" do
     test_root =
       Path.join(

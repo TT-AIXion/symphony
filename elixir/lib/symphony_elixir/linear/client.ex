@@ -103,6 +103,27 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_by_ids_query """
+  query SymphonyLinearIssueCommentsById($ids: [ID!]!, $first: Int!, $commentFirst: Int!) {
+    issues(filter: {id: {in: $ids}}, first: $first) {
+      nodes {
+        id
+        comments(first: $commentFirst) {
+          nodes {
+            id
+            body
+            createdAt
+            updatedAt
+            user {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -157,6 +178,19 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
+    end
+  end
+
+  @spec fetch_issue_comments_by_ids([String.t()]) :: {:ok, %{optional(String.t()) => [map()]}} | {:error, term()}
+  def fetch_issue_comments_by_ids(issue_ids) when is_list(issue_ids) do
+    ids = Enum.uniq(issue_ids)
+
+    case ids do
+      [] ->
+        {:ok, %{}}
+
+      ids ->
+        do_fetch_issue_comments(ids, &graphql/2)
     end
   end
 
@@ -236,6 +270,22 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc false
+  @spec fetch_issue_comments_by_ids_for_test([String.t()], (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, %{optional(String.t()) => [map()]}} | {:error, term()}
+  def fetch_issue_comments_by_ids_for_test(issue_ids, graphql_fun)
+      when is_list(issue_ids) and is_function(graphql_fun, 2) do
+    ids = Enum.uniq(issue_ids)
+
+    case ids do
+      [] ->
+        {:ok, %{}}
+
+      ids ->
+        do_fetch_issue_comments(ids, graphql_fun)
+    end
+  end
+
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
     do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
   end
@@ -306,6 +356,88 @@ defmodule SymphonyElixir.Linear.Client do
         {:error, reason}
     end
   end
+
+  defp do_fetch_issue_comments(ids, graphql_fun)
+       when is_list(ids) and is_function(graphql_fun, 2) do
+    {batched_ids, _rest} = Enum.split(ids, @issue_page_size)
+
+    case graphql_fun.(@comments_by_ids_query, %{
+           ids: batched_ids,
+           first: length(batched_ids),
+           commentFirst: 20
+         }) do
+      {:ok, %{"data" => %{"issues" => %{"nodes" => issues}}}} when is_list(issues) ->
+        {:ok, decode_issue_comments(issues)}
+
+      {:ok, payload} ->
+        {:error, {:unexpected_issue_comments_payload, payload}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_issue_comments(issues) when is_list(issues) do
+    issues
+    |> Enum.reduce(%{}, fn issue, acc ->
+      case issue do
+        %{"id" => issue_id} when is_binary(issue_id) ->
+          comments =
+            issue
+            |> get_in(["comments", "nodes"])
+            |> normalize_issue_comments()
+
+          Map.put(acc, issue_id, comments)
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp normalize_issue_comments(comments) when is_list(comments) do
+    comments
+    |> Enum.map(&normalize_issue_comment/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(fn comment ->
+      case comment[:created_at] do
+        %DateTime{} = created_at -> {0, DateTime.to_unix(created_at, :microsecond), comment[:id] || ""}
+        _ -> {1, 0, comment[:id] || ""}
+      end
+    end)
+  end
+
+  defp normalize_issue_comments(_comments), do: []
+
+  defp normalize_issue_comment(%{} = comment) do
+    %{
+      id: normalize_binary(comment["id"]),
+      body: normalize_binary(comment["body"]),
+      created_at: parse_optional_datetime(comment["createdAt"]),
+      updated_at: parse_optional_datetime(comment["updatedAt"]),
+      user_name: normalize_binary(get_in(comment, ["user", "name"]))
+    }
+  end
+
+  defp normalize_issue_comment(_comment), do: nil
+
+  defp normalize_binary(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_binary(_value), do: nil
+
+  defp parse_optional_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _ -> nil
+    end
+  end
+
+  defp parse_optional_datetime(_value), do: nil
 
   defp issue_order_index(ids) when is_list(ids) do
     ids
