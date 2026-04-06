@@ -1443,6 +1443,93 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner localizes approval questions before posting to Linear" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-question-localized-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_tracker_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, previous_memory_tracker_recipient)
+    end)
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-question-ja"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-question-ja"}}}'
+              printf '%s\\n' '{"method":"mcpServer/elicitation/request","params":{"message":"Allow the linear MCP server to run tool \\"save_comment\\"?","serverName":"linear","_meta":{"tool_title":"Save comment"}}}'
+              ;;
+            *)
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-question-localized",
+        identifier: "MT-204",
+        title: "Localized approval question",
+        description: "Move to Question with a Japanese approval note",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-204",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      assert_receive {:memory_tracker_comment, "issue-question-localized", _start_body}, 1_000
+      assert_receive {:memory_tracker_state_update, "issue-question-localized", "Question"}, 1_000
+      assert_receive {:memory_tracker_comment, "issue-question-localized", question_body}, 1_000
+      assert question_body =~ "## Codex 質問"
+      assert question_body =~ "Linear のツール `コメント保存` を実行する承認が必要です。"
+      refute question_body =~ "Allow the linear MCP server"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner appends Linear steer comments to the next Codex turn prompt" do
     test_root =
       Path.join(

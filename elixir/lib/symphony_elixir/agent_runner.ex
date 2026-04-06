@@ -334,20 +334,9 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp format_question_comment(_issue, payload) do
     question =
-      extract_first_present(payload, [
-        ["params", "question"],
-        [:params, :question],
-        ["params", "message"],
-        [:params, :message],
-        ["params", "prompt"],
-        [:params, :prompt],
-        ["params", "request", "question"],
-        [:params, :request, :question],
-        ["params", "questions", 0, "question"],
-        [:params, :questions, 0, :question],
-        ["params", "_meta", "tool_title"],
-        [:params, :_meta, :tool_title]
-      ]) || "追加の確認が必要です。"
+      payload
+      |> extract_question_text()
+      |> localize_question_text(payload)
 
     """
     ## Codex 質問
@@ -360,6 +349,102 @@ defmodule SymphonyElixir.AgentRunner do
     """
     |> String.trim()
   end
+
+  defp extract_question_text(payload) do
+    extract_first_present(payload, [
+      ["params", "question"],
+      [:params, :question],
+      ["params", "message"],
+      [:params, :message],
+      ["params", "prompt"],
+      [:params, :prompt],
+      ["params", "request", "question"],
+      [:params, :request, :question],
+      ["params", "questions", 0, "question"],
+      [:params, :questions, 0, :question],
+      ["params", "_meta", "tool_title"],
+      [:params, :_meta, :tool_title]
+    ]) || "追加の確認が必要です。"
+  end
+
+  defp localize_question_text(question, payload) when is_binary(question) do
+    cond do
+      String.match?(question, ~r/[\p{Han}\p{Hiragana}\p{Katakana}]/u) ->
+        String.trim(question)
+
+      tool_approval_payload?(payload) ->
+        localize_tool_approval_question(payload)
+
+      true ->
+        "追加の確認が必要です。\n\n原文: #{String.trim(question)}"
+    end
+  end
+
+  defp localize_question_text(_question, _payload), do: "追加の確認が必要です。"
+
+  defp tool_approval_payload?(payload) do
+    extract_first_present(payload, [
+      ["params", "_meta", "tool_title"],
+      [:params, :_meta, :tool_title],
+      ["params", "serverName"],
+      [:params, :serverName]
+    ]) != nil
+  end
+
+  defp localize_tool_approval_question(payload) do
+    server_name =
+      extract_first_present(payload, [
+        ["params", "serverName"],
+        [:params, :serverName]
+      ])
+      |> humanize_tool_server_name()
+
+    tool_title =
+      extract_first_present(payload, [
+        ["params", "_meta", "tool_title"],
+        [:params, :_meta, :tool_title]
+      ])
+      |> humanize_tool_title()
+
+    case {server_name, tool_title} do
+      {server, tool} when is_binary(server) and is_binary(tool) ->
+        "#{server} のツール `#{tool}` を実行する承認が必要です。"
+
+      {server, _tool} when is_binary(server) ->
+        "#{server} の操作を続けるための承認が必要です。"
+
+      {_server, tool} when is_binary(tool) ->
+        "ツール `#{tool}` を実行する承認が必要です。"
+
+      _ ->
+        "追加の確認が必要です。"
+    end
+  end
+
+  defp humanize_tool_server_name(server_name) when is_binary(server_name) do
+    case String.downcase(String.trim(server_name)) do
+      "linear" -> "Linear"
+      "github" -> "GitHub"
+      "gmail" -> "Gmail"
+      "google calendar" -> "Google Calendar"
+      "" -> nil
+      other -> other
+    end
+  end
+
+  defp humanize_tool_server_name(_server_name), do: nil
+
+  defp humanize_tool_title(tool_title) when is_binary(tool_title) do
+    case String.trim(tool_title) do
+      "Save comment" -> "コメント保存"
+      "Save issue" -> "issue 更新"
+      "Create issue" -> "issue 作成"
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp humanize_tool_title(_tool_title), do: nil
 
   defp steer_comment_block(nil), do: nil
 
