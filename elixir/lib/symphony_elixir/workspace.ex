@@ -21,7 +21,8 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host),
+           :ok <- maybe_prepare_issue_branch(workspace, issue_context, worker_host) do
         {:ok, workspace}
       end
     rescue
@@ -233,6 +234,105 @@ defmodule SymphonyElixir.Workspace do
       false ->
         :ok
     end
+  end
+
+  defp maybe_prepare_issue_branch(_workspace, %{branch_name: nil}, _worker_host), do: :ok
+
+  defp maybe_prepare_issue_branch(workspace, %{branch_name: branch_name} = issue_context, nil)
+       when is_binary(workspace) and is_binary(branch_name) do
+    timeout_ms = Config.settings!().hooks.timeout_ms
+    branch_name = String.trim(branch_name)
+
+    if branch_name == "" do
+      :ok
+    else
+      Logger.info("Preparing workspace branch branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
+
+      task =
+        Task.async(fn ->
+          System.cmd("sh", ["-lc", local_branch_prepare_script(branch_name)],
+            cd: workspace,
+            stderr_to_stdout: true
+          )
+        end)
+
+      case Task.yield(task, timeout_ms) do
+        {:ok, {_, 0}} ->
+          :ok
+
+        {:ok, {output, status}} ->
+          Logger.warning(
+            "Workspace branch prepare failed branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitize_hook_output_for_log(output))}"
+          )
+
+          {:error, {:workspace_branch_prepare_failed, branch_name, status, output}}
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+
+          Logger.warning("Workspace branch prepare timed out branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
+
+          {:error, {:workspace_branch_prepare_timeout, branch_name, timeout_ms}}
+      end
+    end
+  end
+
+  defp maybe_prepare_issue_branch(workspace, %{branch_name: branch_name} = issue_context, worker_host)
+       when is_binary(workspace) and is_binary(branch_name) and is_binary(worker_host) do
+    branch_name = String.trim(branch_name)
+
+    if branch_name == "" do
+      :ok
+    else
+      timeout_ms = Config.settings!().hooks.timeout_ms
+
+      Logger.info("Preparing workspace branch branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
+
+      case run_remote_command(
+             worker_host,
+             "cd #{shell_escape(workspace)} && #{local_branch_prepare_script(branch_name)}",
+             timeout_ms
+           ) do
+        {:ok, {_output, 0}} ->
+          :ok
+
+        {:ok, {output, status}} ->
+          Logger.warning(
+            "Workspace branch prepare failed branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitize_hook_output_for_log(output))}"
+          )
+
+          {:error, {:workspace_branch_prepare_failed, branch_name, status, output}}
+
+        {:error, {:workspace_hook_timeout, "remote_command", _timeout_ms}} ->
+          Logger.warning("Workspace branch prepare timed out branch_name=#{branch_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host} timeout_ms=#{timeout_ms}")
+
+          {:error, {:workspace_branch_prepare_timeout, branch_name, timeout_ms}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp maybe_prepare_issue_branch(_workspace, _issue_context, _worker_host), do: :ok
+
+  defp local_branch_prepare_script(branch_name) when is_binary(branch_name) do
+    escaped_branch = shell_escape(branch_name)
+
+    [
+      "set -eu",
+      "branch=#{escaped_branch}",
+      "git rev-parse --is-inside-work-tree >/dev/null 2>&1",
+      "if git show-ref --verify --quiet \"refs/heads/$branch\"; then",
+      "  git switch \"$branch\"",
+      "elif git ls-remote --exit-code --heads origin \"$branch\" >/dev/null 2>&1; then",
+      "  git fetch --depth 1 origin \"$branch:refs/remotes/origin/$branch\"",
+      "  git switch -C \"$branch\" \"origin/$branch\"",
+      "else",
+      "  git switch -C \"$branch\"",
+      "fi"
+    ]
+    |> Enum.join("\n")
   end
 
   defp maybe_run_before_remove_hook(workspace, nil) do
@@ -496,26 +596,38 @@ defmodule SymphonyElixir.Workspace do
     validate_workspace_path(cwd, worker_host)
   end
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier, branch_name: branch_name}) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      branch_name: normalized_branch_name(branch_name)
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      branch_name: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      branch_name: nil
     }
   end
+
+  defp normalized_branch_name(branch_name) when is_binary(branch_name) do
+    case String.trim(branch_name) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalized_branch_name(_branch_name), do: nil
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"

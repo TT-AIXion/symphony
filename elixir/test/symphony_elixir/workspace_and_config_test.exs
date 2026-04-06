@@ -40,6 +40,90 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace checks out an existing issue branch after clone" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-issue-branch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "main branch\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd("git", ["-C", template_repo, "checkout", "-b", "feature/mt-branch"])
+      File.write!(Path.join(template_repo, "README.md"), "feature branch\n")
+      System.cmd("git", ["-C", template_repo, "commit", "-am", "feature"])
+      System.cmd("git", ["-C", template_repo, "checkout", "main"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "git clone --depth 1 #{template_repo} ."
+      )
+
+      issue = %SymphonyElixir.Linear.Issue{
+        id: "issue-branch-existing",
+        identifier: "MT-BRANCH-1",
+        title: "Checkout issue branch",
+        state: "Todo",
+        branch_name: "feature/mt-branch"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert System.cmd("git", ["-C", workspace, "branch", "--show-current"]) == {"feature/mt-branch\n", 0}
+      assert File.read!(Path.join(workspace, "README.md")) == "feature branch\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace creates a local issue branch when the remote branch does not exist" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-local-issue-branch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "main branch\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "git clone --depth 1 #{template_repo} ."
+      )
+
+      issue = %SymphonyElixir.Linear.Issue{
+        id: "issue-branch-new",
+        identifier: "MT-BRANCH-2",
+        title: "Create local issue branch",
+        state: "Todo",
+        branch_name: "feature/mt-new"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert System.cmd("git", ["-C", workspace, "branch", "--show-current"]) == {"feature/mt-new\n", 0}
+      assert File.read!(Path.join(workspace, "README.md")) == "main branch\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(
