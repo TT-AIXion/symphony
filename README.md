@@ -34,6 +34,17 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+For macOS machines where you want Symphony to auto-start after login and keep using the updated
+code from the cloned repo, the repository also ships a one-shot setup command:
+
+```bash
+LINEAR_API_KEY=... ./scripts/setup-macos-service.sh
+```
+
+That setup also installs a companion updater job which runs every 3 hours, pulls the cloned repo,
+falls back to Codex + the `pull` skill if the direct pull fails, rebuilds the escript, and
+restarts the service.
+
 ---
 
 ## License

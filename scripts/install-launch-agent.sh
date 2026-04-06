@@ -6,18 +6,26 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 project_root="$repo_root/elixir"
 service_name="symphony"
 label="com.aixion.symphony.${service_name}"
+updater_label="com.aixion.symphony.${service_name}-updater"
 launch_agents_dir="$HOME/Library/LaunchAgents"
 workflow_dir="$HOME/.config/symphony/workflows"
 workflow_link="$workflow_dir/${service_name}.WORKFLOW.md"
 logs_root="$HOME/.local/state/symphony/${service_name}"
 plist_path="$launch_agents_dir/${label}.plist"
-runner="$HOME/.local/bin/symphony-service-run"
+updater_plist_path="$launch_agents_dir/${updater_label}.plist"
+runner="$repo_root/scripts/symphony-service-run.sh"
+updater_runner="$repo_root/scripts/symphony-repo-update.sh"
 gui_domain="gui/$(id -u)"
 
 mkdir -p "$launch_agents_dir" "$workflow_dir" "$logs_root"
 
 if [[ ! -x "$runner" ]]; then
   echo "missing runner: $runner" >&2
+  exit 1
+fi
+
+if [[ ! -x "$updater_runner" ]]; then
+  echo "missing updater runner: $updater_runner" >&2
   exit 1
 fi
 
@@ -53,12 +61,49 @@ cat > "$plist_path" <<PLIST
 </plist>
 PLIST
 
+cat > "$updater_plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${updater_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${updater_runner}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${repo_root}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>10800</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>${logs_root}/../${service_name}-updater/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${logs_root}/../${service_name}-updater/launchd.err.log</string>
+  </dict>
+</plist>
+PLIST
+
 plutil -lint "$plist_path" >/dev/null
+plutil -lint "$updater_plist_path" >/dev/null
 launchctl bootout "$gui_domain" "$plist_path" >/dev/null 2>&1 || true
+launchctl bootout "$gui_domain" "$updater_plist_path" >/dev/null 2>&1 || true
 launchctl bootstrap "$gui_domain" "$plist_path"
+launchctl bootstrap "$gui_domain" "$updater_plist_path"
 launchctl enable "$gui_domain/$label"
+launchctl enable "$gui_domain/$updater_label"
 launchctl kickstart -k "$gui_domain/$label"
+launchctl kickstart -k "$gui_domain/$updater_label"
 
 echo "Installed $label"
 echo "Plist: $plist_path"
 echo "Workflow: $workflow_link"
+echo "Runner: $runner"
+echo
+echo "Installed $updater_label"
+echo "Plist: $updater_plist_path"
+echo "Runner: $updater_runner"

@@ -14,6 +14,7 @@ This repository contains the Symphony orchestration service and its language-agn
 - Elixir: `1.19.x` on OTP 28 via `mise`
 - Install deps: `cd elixir && mise trust && mise exec -- mix setup`
 - Main quality gate: `cd elixir && make all`
+- Cross-machine macOS service bootstrap: `./scripts/setup-macos-service.sh`
 
 ## Required Skills
 
@@ -65,3 +66,14 @@ This repository contains the Symphony orchestration service and its language-agn
 - `elixir/README.md` for implementation and run instructions
 - `SPEC.md` for specification changes
 - `elixir/WORKFLOW.md` for workflow/prompt/config contract changes
+
+## Service Deployment
+
+- For deterministic repo-local auto-start on macOS after clone, always use `./scripts/setup-macos-service.sh`.
+- Do not hand-roll LaunchAgents, workflow links, or updater jobs when this script is available.
+- The LaunchAgent must execute the runner from the cloned repo path so future `git pull` updates on that clone are picked up automatically.
+- Workflow activation for the local service should symlink `~/.config/symphony/workflows/symphony.WORKFLOW.md` to `<clone>/elixir/WORKFLOW.md`.
+- Install a companion updater LaunchAgent that runs every 3 hours.
+- The updater should try a normal `git pull --ff-only` first.
+- If the normal pull fails, invoke Codex non-interactively to run the `pull` skill in the cloned repo.
+- After a successful update flow, rebuild the escript and restart the Symphony service.

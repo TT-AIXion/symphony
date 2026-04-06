@@ -66,6 +66,29 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+## macOS Auto-Start
+
+For a cloned repo on macOS, you can install a per-user `launchd` service that runs Symphony from
+that clone and therefore picks up future `git pull` updates from the same path:
+
+```bash
+LINEAR_API_KEY=... ./scripts/setup-macos-service.sh
+```
+
+What it does:
+
+- writes `~/.config/symphony/linear_api_key` when `LINEAR_API_KEY` is set
+- runs `mise trust`, `mise install`, `mix setup`, and `mix build`
+- installs `~/Library/LaunchAgents/com.aixion.symphony.symphony.plist`
+- installs `~/Library/LaunchAgents/com.aixion.symphony.symphony-updater.plist`
+- symlinks `~/.config/symphony/workflows/symphony.WORKFLOW.md` to `<clone>/elixir/WORKFLOW.md`
+- configures the LaunchAgent to execute `<clone>/scripts/symphony-service-run.sh`
+- configures the updater to run every 3 hours from the same clone, try `git pull --ff-only`, fall
+  back to Codex + the `pull` skill if needed, rebuild, and restart the service
+
+Because the LaunchAgent points at the cloned repo path, updating that clone updates the service code
+used on the next restart or restart kick.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
