@@ -15,7 +15,10 @@ fi
 
 current_user="$(
   gh auth status 2>/dev/null |
-    awk '/Active account:/ { print $NF; exit }'
+    awk '
+      /Logged in to github.com account / { account = $(NF-1) }
+      /Active account: true/ { print account; exit }
+    '
 )"
 
 restore_user="$current_user"
@@ -39,4 +42,8 @@ if [ "$current_user" != "$required_user" ]; then
   switched=1
 fi
 
-exec "$@"
+"$@"
+exit_code=$?
+restore
+trap - EXIT
+exit "$exit_code"
