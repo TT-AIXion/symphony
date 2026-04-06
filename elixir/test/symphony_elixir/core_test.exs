@@ -1248,11 +1248,109 @@ defmodule SymphonyElixir.CoreTest do
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
+      assert_receive {:memory_tracker_comment, "issue-final-comment", activity_body}, 1_000
+      assert activity_body =~ "## Codex Activity"
+      assert activity_body =~ "Started work on this issue."
+
       assert_receive {:memory_tracker_comment, "issue-final-comment", body}, 1_000
       assert body =~ "## Codex Final Response"
       assert body =~ "Turn: 1/1"
       assert body =~ "Session: `thread-comment-turn-comment`"
       assert body =~ "Shipped the fix."
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner moves Todo issues to In Progress before starting Codex work" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-start-comment-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_tracker_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    on_exit(fn ->
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, previous_memory_tracker_recipient)
+    end)
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-start"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-start"}}}'
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+            *)
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 1
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-start-comment",
+        identifier: "MT-201",
+        title: "Start comment",
+        description: "Move Todo to In Progress before Codex starts",
+        state: "Todo",
+        url: "https://example.org/issues/MT-201",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      assert_receive {:memory_tracker_state_update, "issue-start-comment", "In Progress"}, 1_000
+      assert_receive {:memory_tracker_comment, "issue-start-comment", body}, 1_000
+      assert body =~ "## Codex Activity"
+      assert body =~ "Started work on this issue."
+      assert body =~ "Worker: `local`"
+      assert body =~ "Workspace: `"
     after
       File.rm_rf(test_root)
     end

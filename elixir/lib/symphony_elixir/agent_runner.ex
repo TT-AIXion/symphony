@@ -31,12 +31,13 @@ defmodule SymphonyElixir.AgentRunner do
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        with {:ok, codex_cwd} <- Workspace.codex_cwd(workspace, worker_host) do
+        with {:ok, codex_cwd} <- Workspace.codex_cwd(workspace, worker_host),
+             {:ok, prepared_issue} <- prepare_issue_for_execution(issue, codex_cwd, worker_host) do
           send_worker_runtime_info(codex_update_recipient, issue, worker_host, codex_cwd)
 
           try do
             with :ok <- Workspace.run_before_run_hook(codex_cwd, issue, worker_host) do
-              run_codex_turns(codex_cwd, issue, codex_update_recipient, opts, worker_host)
+              run_codex_turns(codex_cwd, prepared_issue, codex_update_recipient, opts, worker_host)
             end
           after
             Workspace.run_after_run_hook(codex_cwd, issue, worker_host)
@@ -146,6 +147,62 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp prepare_issue_for_execution(%Issue{} = issue, workspace, worker_host) when is_binary(workspace) do
+    with {:ok, prepared_issue} <- ensure_issue_in_progress(issue) do
+      maybe_comment_start(prepared_issue, workspace, worker_host)
+      {:ok, prepared_issue}
+    end
+  end
+
+  defp prepare_issue_for_execution(issue, _workspace, _worker_host), do: {:ok, issue}
+
+  defp ensure_issue_in_progress(%Issue{id: issue_id, state: state_name} = issue)
+       when is_binary(issue_id) and is_binary(state_name) do
+    if normalize_issue_state(state_name) == "todo" do
+      case Tracker.update_issue_state(issue_id, "In Progress") do
+        :ok ->
+          Logger.info("Transitioned issue to In Progress before Codex work for #{issue_context(issue)}")
+          {:ok, %{issue | state: "In Progress"}}
+
+        {:error, reason} ->
+          Logger.warning("Failed to transition issue to In Progress before Codex work for #{issue_context(issue)}: #{inspect(reason)}")
+          {:error, {:issue_state_transition_failed, reason}}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp ensure_issue_in_progress(issue), do: {:ok, issue}
+
+  defp maybe_comment_start(%Issue{id: issue_id} = issue, workspace, worker_host)
+       when is_binary(issue_id) and is_binary(workspace) do
+    body = format_start_comment(issue, workspace, worker_host)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        Logger.info("Posted Linear activity comment for #{issue_context(issue)} workspace=#{workspace}")
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to post Linear activity comment for #{issue_context(issue)} workspace=#{workspace}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp maybe_comment_start(_issue, _workspace, _worker_host), do: :ok
+
+  defp format_start_comment(_issue, workspace, worker_host) do
+    """
+    ## Codex Activity
+
+    Started work on this issue.
+    Worker: `#{worker_host_for_log(worker_host)}`
+    Workspace: `#{workspace}`
+    """
+    |> String.trim()
   end
 
   defp maybe_comment_final_response(
